@@ -1935,6 +1935,13 @@ fn parse_all_messages_with_pricing_with_env_strategy(
                 .filter(|message| should_keep_deduped_message(&mut hermes_seen, message)),
         );
     }
+    if let Some(path) = &scan_result.catdesk_usage_ledger {
+        all_messages.extend(
+            sessions::hermes::parse_catdesk_usage_jsonl(path)
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut hermes_seen, message)),
+        );
+    }
 
     if let Some(db_path) = &scan_result.goose_db {
         let goose_messages: Vec<UnifiedMessage> = sessions::goose::parse_goose_sqlite(db_path)
@@ -4037,11 +4044,18 @@ where
         }
     }
 
-    // ---- Hermes SQLite (own dedup set) ----
+    // ---- Hermes SQLite + CatDesk usage ledger (own dedup set) ----
     {
         let mut hermes_seen: HashSet<String> = HashSet::new();
         for db_path in scan_result.hermes_db_paths() {
             for m in parse_hermes_sqlite_with_pricing(&db_path, pricing) {
+                if !passes_client(&m) { continue; }
+                let keep = m.dedup_key.as_ref().is_none_or(|k| k.is_empty() || dedup_gate_passes(k, &mut hermes_seen));
+                if keep && filter(&m) { sink(&m); }
+            }
+        }
+        if let Some(path) = &scan_result.catdesk_usage_ledger {
+            for m in sessions::hermes::parse_catdesk_usage_jsonl(path) {
                 if !passes_client(&m) { continue; }
                 let keep = m.dedup_key.as_ref().is_none_or(|k| k.is_empty() || dedup_gate_passes(k, &mut hermes_seen));
                 if keep && filter(&m) { sink(&m); }
@@ -4688,6 +4702,9 @@ fn latest_source_mtime_ms_from_scan(scan_result: &scanner::ScanResult) -> u64 {
     // scan roots (the `files` lanes) — use the plural helpers so every db gets
     // its `-wal` sidecar probed, not just the default-path single.
     dbs.extend(scan_result.hermes_db_paths());
+    if let Some(path) = &scan_result.catdesk_usage_ledger {
+        latest = latest.max(file_mtime_ms(path).unwrap_or(0));
+    }
     dbs.extend(scan_result.zed_db_paths());
     dbs.extend(scan_result.crush_dbs.iter().map(|c| c.db_path.clone()));
     // Antigravity CLI conversation `.db` files arrive via the generic `files`
@@ -4775,6 +4792,9 @@ pub fn local_source_change_token(options: &LocalParseOptions) -> Result<u64, Str
     ];
     dbs.extend(single_dbs.into_iter().flatten().cloned());
     dbs.extend(scan_result.hermes_db_paths());
+    if let Some(path) = &scan_result.catdesk_usage_ledger {
+        paths.push(path.clone());
+    }
     dbs.extend(scan_result.zed_db_paths());
     dbs.extend(
         scan_result
@@ -5522,14 +5542,22 @@ pub fn parse_local_clients(options: LocalParseOptions) -> Result<ParsedMessages,
     };
 
     let hermes_db_paths = scan_result.hermes_db_paths();
-    if !hermes_db_paths.is_empty() {
+    if !hermes_db_paths.is_empty() || scan_result.catdesk_usage_ledger.is_some() {
         let mut hermes_seen: HashSet<String> = HashSet::new();
-        let hermes_msgs: Vec<ParsedMessage> = hermes_db_paths
+        let mut hermes_msgs: Vec<ParsedMessage> = hermes_db_paths
             .iter()
             .flat_map(|db_path| sessions::hermes::parse_hermes_sqlite(db_path))
             .filter(|msg| should_keep_deduped_message(&mut hermes_seen, msg))
             .map(|msg| unified_to_parsed(&msg))
             .collect();
+        if let Some(path) = &scan_result.catdesk_usage_ledger {
+            hermes_msgs.extend(
+                sessions::hermes::parse_catdesk_usage_jsonl(path)
+                    .into_iter()
+                    .filter(|msg| should_keep_deduped_message(&mut hermes_seen, msg))
+                    .map(|msg| unified_to_parsed(&msg)),
+            );
+        }
         let count = summed_parsed_message_count(&hermes_msgs);
         counts.set(ClientId::Hermes, count);
         messages.extend(hermes_msgs);
@@ -14858,6 +14886,73 @@ mod tests {
         assert_eq!(counted.messages[0].session_id, "hermes-auto-profile");
         assert_eq!(counted.messages[0].input, 100);
         assert_eq!(counted.messages[0].output, 25);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_catdesk_usage_reaches_hermes_totals_and_model_report() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let streaming_cache = tempfile::TempDir::new().unwrap();
+        let catdesk_dir = source_home.path().join(".catdesk");
+        std::fs::create_dir_all(&catdesk_dir).unwrap();
+        std::fs::write(
+            catdesk_dir.join("usage.jsonl"),
+            concat!(
+                "{\"eventId\":\"evt-a\",\"timestampMs\":1788210000123,\"inputTokens\":12,\"outputTokens\":8,\"bucket\":\"through-gpt-5.6\"}\n",
+                "{\"eventId\":\"evt-b\",\"timestampMs\":1788210001123,\"inputTokens\":5,\"outputTokens\":7,\"bucket\":\"through-gpt-5.6\"}\n"
+            ),
+        )
+        .unwrap();
+
+        let home = source_home.path().to_str().unwrap().to_string();
+        let clients = vec!["hermes".to_string()];
+        let counted = parse_local_clients(LocalParseOptions {
+            home_dir: Some(home.clone()),
+            use_env_roots: false,
+            clients: Some(clients.clone()),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+            modified_after: None,
+        })
+        .unwrap();
+        assert_eq!(counted.counts.get(ClientId::Hermes), 2);
+        assert_eq!(counted.messages.len(), 2);
+        assert!(counted.messages.iter().all(|message| message.client == "hermes"));
+        assert!(
+            counted
+                .messages
+                .iter()
+                .all(|message| message.model_id == "catdesk-mcp")
+        );
+        assert_eq!(counted.messages.iter().map(|message| message.input).sum::<i64>(), 17);
+        assert_eq!(counted.messages.iter().map(|message| message.output).sum::<i64>(), 15);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let report = with_isolated_tokscale_cache(streaming_cache.path(), || {
+            runtime
+                .block_on(get_model_report(ReportOptions {
+                    home_dir: Some(home),
+                    use_env_roots: false,
+                    clients: Some(clients),
+                    ..Default::default()
+                }))
+                .unwrap()
+        });
+        assert_eq!(report.total_input, 17);
+        assert_eq!(report.total_output, 15);
+        assert_eq!(report.total_messages, 2);
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].client, "hermes");
+        assert_eq!(report.entries[0].model, "catdesk-mcp");
+        assert_eq!(report.entries[0].provider, "catdesk");
+        assert_eq!(report.entries[0].input, 17);
+        assert_eq!(report.entries[0].output, 15);
+        assert_eq!(report.total_cost, 0.0);
     }
 
     #[test]
