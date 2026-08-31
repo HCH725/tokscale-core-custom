@@ -83,6 +83,8 @@ pub struct ScanResult {
     pub synthetic_db: Option<PathBuf>,
     pub kilo_db: Option<PathBuf>,
     pub hermes_db: Option<PathBuf>,
+    /// CatDesk's append-only MCP token ledger, attributed to the Hermes client.
+    pub catdesk_usage_ledger: Option<PathBuf>,
     pub goose_db: Option<PathBuf>,
     pub zed_db: Option<PathBuf>,
     pub kiro_db: Option<PathBuf>,
@@ -100,6 +102,7 @@ impl Default for ScanResult {
             synthetic_db: None,
             kilo_db: None,
             hermes_db: None,
+            catdesk_usage_ledger: None,
             goose_db: None,
             zed_db: None,
             kiro_db: None,
@@ -1233,6 +1236,11 @@ fn scan_all_clients_with_env_strategy_inner(
         extra_dbs.sort_unstable();
         extra_dbs.dedup();
         result.get_mut(ClientId::Hermes).extend(extra_dbs);
+
+        let catdesk_usage_ledger = PathBuf::from(home_dir).join(".catdesk/usage.jsonl");
+        if catdesk_usage_ledger.is_file() {
+            result.catdesk_usage_ledger = Some(catdesk_usage_ledger);
+        }
     }
 
     if enabled.contains(&ClientId::Goose) {
@@ -2693,6 +2701,36 @@ mod tests {
             &settings,
         );
         assert_eq!(hermes_only.hermes_db_paths(), vec![profile_db]);
+    }
+
+    #[test]
+    fn test_scan_all_clients_discovers_catdesk_usage_only_for_hermes() {
+        let dir = TempDir::new().unwrap();
+        let home = dir.path();
+        let catdesk_dir = home.join(".catdesk");
+        fs::create_dir_all(&catdesk_dir).unwrap();
+        let ledger_path = catdesk_dir.join("usage.jsonl");
+        fs::write(&ledger_path, "{}\n").unwrap();
+
+        let settings = ScannerSettings::default();
+        let claude_only = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["claude".to_string()],
+            false,
+            &settings,
+        );
+        assert!(claude_only.catdesk_usage_ledger.is_none());
+
+        let hermes_only = scan_all_clients_with_scanner_settings(
+            home.to_str().unwrap(),
+            &["hermes".to_string()],
+            false,
+            &settings,
+        );
+        assert_eq!(
+            hermes_only.catdesk_usage_ledger.as_ref(),
+            Some(&ledger_path)
+        );
     }
 
     #[test]

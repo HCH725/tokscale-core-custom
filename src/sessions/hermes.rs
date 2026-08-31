@@ -8,10 +8,25 @@
 use super::UnifiedMessage;
 use crate::{provider_identity, TokenBreakdown};
 use rusqlite::Connection;
+use serde::Deserialize;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 use std::path::Path;
 use tracing::warn;
 
 const HERMES_AGENT_NAME: &str = "Hermes Agent";
+const CATDESK_MODEL_ID: &str = "catdesk-mcp";
+const CATDESK_PROVIDER_ID: &str = "catdesk";
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CatDeskUsageEntry {
+    timestamp_ms: u64,
+    input_tokens: u64,
+    output_tokens: u64,
+    #[serde(rename = "bucket")]
+    _bucket: String,
+}
 
 fn timestamp_secs_to_ms(timestamp: f64) -> i64 {
     if timestamp > 1e12 {
@@ -31,6 +46,79 @@ fn resolved_provider(billing_provider: Option<String>, model_id: &str) -> String
 
 fn valid_cost(cost: Option<f64>) -> Option<f64> {
     cost.filter(|cost| cost.is_finite() && *cost >= 0.0)
+}
+
+pub fn parse_catdesk_usage_jsonl(path: &Path) -> Vec<UnifiedMessage> {
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(err) => {
+            warn!(
+                path = %path.display(),
+                error = %err,
+                "Failed to open CatDesk usage ledger"
+            );
+            return Vec::new();
+        }
+    };
+
+    BufReader::new(file)
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            let line = match line {
+                Ok(line) => line,
+                Err(err) => {
+                    warn!(
+                        path = %path.display(),
+                        line = index + 1,
+                        error = %err,
+                        "Failed to read CatDesk usage ledger row"
+                    );
+                    return None;
+                }
+            };
+            if line.trim().is_empty() {
+                return None;
+            }
+
+            let entry: CatDeskUsageEntry = match serde_json::from_str(&line) {
+                Ok(entry) => entry,
+                Err(err) => {
+                    warn!(
+                        path = %path.display(),
+                        line = index + 1,
+                        error = %err,
+                        "Failed to decode CatDesk usage ledger row"
+                    );
+                    return None;
+                }
+            };
+            if entry.input_tokens == 0 && entry.output_tokens == 0 {
+                return None;
+            }
+
+            let timestamp = entry.timestamp_ms.min(i64::MAX as u64) as i64;
+            let session_id = format!("catdesk:{}:{}", entry.timestamp_ms, index + 1);
+            let mut msg = UnifiedMessage::new_with_agent(
+                "hermes",
+                CATDESK_MODEL_ID,
+                CATDESK_PROVIDER_ID,
+                session_id.clone(),
+                timestamp,
+                TokenBreakdown {
+                    input: entry.input_tokens.min(i64::MAX as u64) as i64,
+                    output: entry.output_tokens.min(i64::MAX as u64) as i64,
+                    cache_read: 0,
+                    cache_write: 0,
+                    reasoning: 0,
+                },
+                0.0,
+                Some(HERMES_AGENT_NAME.to_string()),
+            );
+            msg.dedup_key = Some(session_id);
+            Some(msg)
+        })
+        .collect()
 }
 
 pub fn parse_hermes_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
@@ -276,5 +364,40 @@ mod tests {
             message("unknown").cost_source,
             crate::sessions::CostSource::Unknown
         );
+    }
+
+    #[test]
+    fn test_parse_catdesk_usage_jsonl_as_hermes_client() {
+        let dir = TempDir::new().unwrap();
+        let ledger_path = dir.path().join("usage.jsonl");
+        std::fs::write(
+            &ledger_path,
+            concat!(
+                "{\"timestampMs\":1788210000123,\"inputTokens\":12,\"outputTokens\":8,\"bucket\":\"through-gpt-5.6\"}\n",
+                "{\"timestampMs\":1788210001123,\"inputTokens\":5,\"outputTokens\":7,\"bucket\":\"through-gpt-5.6\"}\n"
+            ),
+        )
+        .unwrap();
+
+        let messages = parse_catdesk_usage_jsonl(&ledger_path);
+        assert_eq!(messages.len(), 2);
+        assert!(messages.iter().all(|message| message.client == "hermes"));
+        assert!(messages
+            .iter()
+            .all(|message| message.model_id == CATDESK_MODEL_ID));
+        assert!(messages
+            .iter()
+            .all(|message| message.provider_id == CATDESK_PROVIDER_ID));
+        assert!(messages.iter().all(|message| message.cost == 0.0));
+        assert_eq!(messages[0].tokens.input, 12);
+        assert_eq!(messages[0].tokens.output, 8);
+        assert_eq!(messages[1].tokens.input, 5);
+        assert_eq!(messages[1].tokens.output, 7);
+        assert_eq!(messages[0].timestamp, 1_788_210_000_123);
+        assert_eq!(messages[0].agent.as_deref(), Some(HERMES_AGENT_NAME));
+        assert!(messages[0]
+            .dedup_key
+            .as_deref()
+            .is_some_and(|key| key.starts_with("catdesk:")));
     }
 }
