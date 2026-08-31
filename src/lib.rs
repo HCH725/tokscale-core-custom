@@ -14898,8 +14898,8 @@ mod tests {
         std::fs::write(
             catdesk_dir.join("usage.jsonl"),
             concat!(
-                "{\"timestampMs\":1788210000123,\"inputTokens\":12,\"outputTokens\":8,\"bucket\":\"through-gpt-5.6\"}\n",
-                "{\"timestampMs\":1788210001123,\"inputTokens\":5,\"outputTokens\":7,\"bucket\":\"through-gpt-5.6\"}\n"
+                "{\"eventId\":\"evt-a\",\"timestampMs\":1788210000123,\"inputTokens\":12,\"outputTokens\":8,\"bucket\":\"through-gpt-5.6\"}\n",
+                "{\"eventId\":\"evt-b\",\"timestampMs\":1788210001123,\"inputTokens\":5,\"outputTokens\":7,\"bucket\":\"through-gpt-5.6\"}\n"
             ),
         )
         .unwrap();

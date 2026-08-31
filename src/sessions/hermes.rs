@@ -21,11 +21,11 @@ const CATDESK_PROVIDER_ID: &str = "catdesk";
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct CatDeskUsageEntry {
+    event_id: Option<String>,
     timestamp_ms: u64,
     input_tokens: u64,
     output_tokens: u64,
-    #[serde(rename = "bucket")]
-    _bucket: String,
+    bucket: String,
 }
 
 fn timestamp_secs_to_ms(timestamp: f64) -> i64 {
@@ -98,7 +98,19 @@ pub fn parse_catdesk_usage_jsonl(path: &Path) -> Vec<UnifiedMessage> {
             }
 
             let timestamp = entry.timestamp_ms.min(i64::MAX as u64) as i64;
-            let session_id = format!("catdesk:{}:{}", entry.timestamp_ms, index + 1);
+            let stable_id = entry
+                .event_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(|value| format!("event:{value}"))
+                .unwrap_or_else(|| {
+                    format!(
+                        "legacy:{}:{}:{}:{}",
+                        entry.timestamp_ms, entry.input_tokens, entry.output_tokens, entry.bucket
+                    )
+                });
+            let session_id = format!("catdesk:{stable_id}");
             let mut msg = UnifiedMessage::new_with_agent(
                 "hermes",
                 CATDESK_MODEL_ID,
@@ -373,8 +385,8 @@ mod tests {
         std::fs::write(
             &ledger_path,
             concat!(
-                "{\"timestampMs\":1788210000123,\"inputTokens\":12,\"outputTokens\":8,\"bucket\":\"through-gpt-5.6\"}\n",
-                "{\"timestampMs\":1788210001123,\"inputTokens\":5,\"outputTokens\":7,\"bucket\":\"through-gpt-5.6\"}\n"
+                "{\"eventId\":\"evt-a\",\"timestampMs\":1788210000123,\"inputTokens\":12,\"outputTokens\":8,\"bucket\":\"through-gpt-5.6\"}\n",
+                "{\"eventId\":\"evt-b\",\"timestampMs\":1788210001123,\"inputTokens\":5,\"outputTokens\":7,\"bucket\":\"through-gpt-5.6\"}\n"
             ),
         )
         .unwrap();
@@ -395,9 +407,38 @@ mod tests {
         assert_eq!(messages[1].tokens.output, 7);
         assert_eq!(messages[0].timestamp, 1_788_210_000_123);
         assert_eq!(messages[0].agent.as_deref(), Some(HERMES_AGENT_NAME));
-        assert!(messages[0]
-            .dedup_key
-            .as_deref()
-            .is_some_and(|key| key.starts_with("catdesk:")));
+        assert_eq!(messages[0].dedup_key.as_deref(), Some("catdesk:event:evt-a"));
+        assert_eq!(messages[1].dedup_key.as_deref(), Some("catdesk:event:evt-b"));
+    }
+
+    #[test]
+    fn test_parse_catdesk_usage_jsonl_keeps_identity_when_rows_move_and_skips_partial_tail() {
+        let dir = TempDir::new().unwrap();
+        let first_path = dir.path().join("first.jsonl");
+        let second_path = dir.path().join("second.jsonl");
+        let row_a = "{\"eventId\":\"stable-a\",\"timestampMs\":1788210000123,\"inputTokens\":12,\"outputTokens\":8,\"bucket\":\"through-gpt-5.6\"}";
+        let row_b = "{\"eventId\":\"stable-b\",\"timestampMs\":1788210001123,\"inputTokens\":5,\"outputTokens\":7,\"bucket\":\"through-gpt-5.6\"}";
+        std::fs::write(&first_path, format!("{row_a}\n{row_b}\n{{\"eventId\":"))
+            .unwrap();
+        std::fs::write(&second_path, format!("{row_b}\n{row_a}\n"))
+            .unwrap();
+
+        let first = parse_catdesk_usage_jsonl(&first_path);
+        let second = parse_catdesk_usage_jsonl(&second_path);
+        assert_eq!(first.len(), 2);
+        assert_eq!(second.len(), 2);
+
+        let mut first_keys = first
+            .iter()
+            .filter_map(|message| message.dedup_key.clone())
+            .collect::<Vec<_>>();
+        let mut second_keys = second
+            .iter()
+            .filter_map(|message| message.dedup_key.clone())
+            .collect::<Vec<_>>();
+        first_keys.sort();
+        second_keys.sort();
+        assert_eq!(first_keys, second_keys);
+        assert_eq!(first_keys, vec!["catdesk:event:stable-a", "catdesk:event:stable-b"]);
     }
 }
