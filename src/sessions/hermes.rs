@@ -48,7 +48,7 @@ fn timestamp_secs_to_ms(timestamp: f64) -> i64 {
     }
 }
 
-fn resolved_provider(billing_provider: Option<String>, model_id: &str) -> String {
+fn resolved_provider(billing_provider: Option<&str>, model_id: &str) -> String {
     billing_provider
         .filter(|provider| !provider.trim().is_empty())
         .and_then(|provider| provider_identity::canonical_provider(provider.trim()))
@@ -186,6 +186,8 @@ pub fn parse_hermes_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
             id,
             model,
             billing_provider,
+            billing_mode,
+            cost_status,
             started_at,
             message_count,
             input_tokens,
@@ -229,15 +231,17 @@ pub fn parse_hermes_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
             row.get::<_, String>(0)?,
             row.get::<_, String>(1)?,
             row.get::<_, Option<String>>(2)?,
-            row.get::<_, f64>(3)?,
-            row.get::<_, Option<i32>>(4)?.unwrap_or(0),
-            row.get::<_, Option<i64>>(5)?.unwrap_or(0),
-            row.get::<_, Option<i64>>(6)?.unwrap_or(0),
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Option<String>>(4)?,
+            row.get::<_, f64>(5)?,
+            row.get::<_, Option<i32>>(6)?.unwrap_or(0),
             row.get::<_, Option<i64>>(7)?.unwrap_or(0),
             row.get::<_, Option<i64>>(8)?.unwrap_or(0),
             row.get::<_, Option<i64>>(9)?.unwrap_or(0),
-            row.get::<_, Option<f64>>(10)?,
-            row.get::<_, Option<f64>>(11)?,
+            row.get::<_, Option<i64>>(10)?.unwrap_or(0),
+            row.get::<_, Option<i64>>(11)?.unwrap_or(0),
+            row.get::<_, Option<f64>>(12)?,
+            row.get::<_, Option<f64>>(13)?,
         ))
     }) {
         Ok(r) => r,
@@ -267,6 +271,8 @@ pub fn parse_hermes_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
             session_id,
             model_id,
             billing_provider,
+            billing_mode,
+            cost_status,
             started_at,
             message_count,
             input,
@@ -277,15 +283,32 @@ pub fn parse_hermes_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
             estimated_cost,
             actual_cost,
         )| {
-            let provider = resolved_provider(billing_provider, &model_id);
-            let (cost, is_provider_reported, is_estimated) =
-                if let Some(cost) = valid_cost(actual_cost) {
-                    (cost, true, false)
-                } else if let Some(cost) = valid_cost(estimated_cost) {
-                    (cost, false, true)
-                } else {
-                    (0.0, false, false)
-                };
+            let provider = resolved_provider(billing_provider.as_deref(), &model_id);
+            let actual_cost_absent_or_zero = match actual_cost {
+                None => true,
+                Some(cost) => cost.is_finite() && cost == 0.0,
+            };
+            let subscription_included = billing_provider
+                .as_deref()
+                .is_some_and(|value| value.trim().eq_ignore_ascii_case("openai-codex"))
+                && billing_mode.as_deref().is_some_and(|value| {
+                    let mode = value.trim();
+                    mode.eq_ignore_ascii_case("subscription_included")
+                        || mode.eq_ignore_ascii_case("codex_responses")
+                })
+                && cost_status
+                    .as_deref()
+                    .is_some_and(|value| value.trim().eq_ignore_ascii_case("included"))
+                && actual_cost_absent_or_zero;
+            let (cost, is_provider_reported, is_estimated) = if subscription_included {
+                (0.0, false, false)
+            } else if let Some(cost) = valid_cost(actual_cost) {
+                (cost, true, false)
+            } else if let Some(cost) = valid_cost(estimated_cost) {
+                (cost, false, true)
+            } else {
+                (0.0, false, false)
+            };
             let mut msg = UnifiedMessage::new_with_agent(
                 "hermes",
                 model_id,
@@ -302,7 +325,9 @@ pub fn parse_hermes_sqlite(db_path: &Path) -> Vec<UnifiedMessage> {
                 cost,
                 Some(HERMES_AGENT_NAME.to_string()),
             );
-            if is_provider_reported {
+            if subscription_included {
+                msg.mark_subscription_included_cost();
+            } else if is_provider_reported {
                 msg.mark_provider_reported_cost();
             } else if is_estimated {
                 msg.mark_estimated_cost();
@@ -330,6 +355,8 @@ mod tests {
                 id TEXT PRIMARY KEY,
                 model TEXT,
                 billing_provider TEXT,
+                billing_mode TEXT,
+                cost_status TEXT,
                 started_at REAL,
                 message_count INTEGER,
                 input_tokens INTEGER,
@@ -379,10 +406,35 @@ mod tests {
             )
             .unwrap();
         }
+        conn.execute(
+            "INSERT INTO sessions (
+                id, model, billing_provider, billing_mode, cost_status,
+                started_at, message_count, input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                estimated_cost_usd, actual_cost_usd
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                "included",
+                "gpt-5.4",
+                "openai-codex",
+                "subscription_included",
+                "included",
+                1_700_000_000.0_f64,
+                1_i32,
+                10_i64,
+                0_i64,
+                0_i64,
+                0_i64,
+                0_i64,
+                Some(0.0_f64),
+                Option::<f64>::None,
+            ],
+        )
+        .unwrap();
         drop(conn);
 
         let messages = parse_hermes_sqlite(&db_path);
-        assert_eq!(messages.len(), 4);
+        assert_eq!(messages.len(), 5);
 
         let message = |id: &str| {
             messages
@@ -398,6 +450,12 @@ mod tests {
         assert_eq!(
             message("estimated").cost_source,
             crate::sessions::CostSource::Estimated
+        );
+        assert_eq!(message("included").provider_id, "openai");
+        assert_eq!(message("included").cost, 0.0);
+        assert_eq!(
+            message("included").cost_source,
+            crate::sessions::CostSource::SubscriptionIncluded
         );
         assert_eq!(message("invalid-actual").cost, 0.4);
         assert_eq!(
@@ -439,8 +497,14 @@ mod tests {
         assert_eq!(messages[1].tokens.output, 5);
         assert_eq!(messages[0].timestamp, 1_788_210_000_123);
         assert_eq!(messages[0].agent.as_deref(), Some(HERMES_AGENT_NAME));
-        assert_eq!(messages[0].dedup_key.as_deref(), Some("catdesk:event:evt-a"));
-        assert_eq!(messages[1].dedup_key.as_deref(), Some("catdesk:event:evt-b"));
+        assert_eq!(
+            messages[0].dedup_key.as_deref(),
+            Some("catdesk:event:evt-a")
+        );
+        assert_eq!(
+            messages[1].dedup_key.as_deref(),
+            Some("catdesk:event:evt-b")
+        );
     }
 
     #[test]
@@ -469,10 +533,8 @@ mod tests {
         let second_path = dir.path().join("second.jsonl");
         let row_a = "{\"eventId\":\"stable-a\",\"timestampMs\":1788210000123,\"inputTokens\":12,\"outputTokens\":8,\"bucket\":\"through-gpt-5.6\"}";
         let row_b = "{\"eventId\":\"stable-b\",\"timestampMs\":1788210001123,\"inputTokens\":5,\"outputTokens\":7,\"bucket\":\"through-gpt-5.6\"}";
-        std::fs::write(&first_path, format!("{row_a}\n{row_b}\n{{\"eventId\":"))
-            .unwrap();
-        std::fs::write(&second_path, format!("{row_b}\n{row_a}\n"))
-            .unwrap();
+        std::fs::write(&first_path, format!("{row_a}\n{row_b}\n{{\"eventId\":")).unwrap();
+        std::fs::write(&second_path, format!("{row_b}\n{row_a}\n")).unwrap();
 
         let first = parse_catdesk_usage_jsonl(&first_path);
         let second = parse_catdesk_usage_jsonl(&second_path);
@@ -490,6 +552,163 @@ mod tests {
         first_keys.sort();
         second_keys.sort();
         assert_eq!(first_keys, second_keys);
-        assert_eq!(first_keys, vec!["catdesk:event:stable-a", "catdesk:event:stable-b"]);
+        assert_eq!(
+            first_keys,
+            vec!["catdesk:event:stable-a", "catdesk:event:stable-b"]
+        );
+    }
+
+    #[test]
+    fn test_openai_codex_subscription_included_both_modes_are_authoritative() {
+        // `billing_provider=openai-codex` + `cost_status=included` must be
+        // authoritative subscription usage regardless of billing_mode value.
+        // See run_agent.py: ChatGPT OAuth Codex Responses backend uses
+        // api_mode=codex_responses, which persists as billing_mode=codex_responses.
+        let (_dir, db_path) = create_test_db();
+        let conn = Connection::open(&db_path).unwrap();
+        for (id, billing_mode) in [
+            ("sub-included", "subscription_included"),
+            ("codex-responses-included", "codex_responses"),
+        ] {
+            conn.execute(
+                "INSERT INTO sessions (
+                    id, model, billing_provider, billing_mode, cost_status,
+                    started_at, message_count, input_tokens, output_tokens,
+                    cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                    estimated_cost_usd, actual_cost_usd
+                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                params![
+                    id,
+                    "gpt-5.4",
+                    "openai-codex",
+                    billing_mode,
+                    "included",
+                    1_700_000_000.0_f64,
+                    1_i32,
+                    10_i64,
+                    5_i64,
+                    0_i64,
+                    0_i64,
+                    0_i64,
+                    Some(0.0_f64),
+                    Option::<f64>::None,
+                ],
+            )
+            .unwrap();
+        }
+        drop(conn);
+
+        let messages = parse_hermes_sqlite(&db_path);
+        assert_eq!(messages.len(), 2);
+
+        for id in ["sub-included", "codex-responses-included"] {
+            let msg = messages
+                .iter()
+                .find(|m| m.session_id == id)
+                .unwrap_or_else(|| panic!("missing {id}"));
+            // Attribution identity unchanged: canonical provider stays `openai`.
+            assert_eq!(msg.provider_id, "openai", "provider identity for {id}");
+            assert_eq!(
+                msg.cost, 0.0,
+                "raw cost must remain authoritative zero for {id}"
+            );
+            assert_eq!(
+                msg.cost_source,
+                crate::sessions::CostSource::SubscriptionIncluded,
+                "cost_source for {id}"
+            );
+            // No broad guessing: actual pricing is not provider-reported, list-price
+            // equivalent remains separate (verified via list_price_equivalent_cost_for_message).
+            assert!(msg.has_authoritative_cost());
+        }
+    }
+
+
+    #[test]
+    fn test_openai_codex_included_with_invalid_actual_cost_is_not_subscription() {
+        let (_dir, db_path) = create_test_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (
+                id, model, billing_provider, billing_mode, cost_status,
+                started_at, message_count, input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                estimated_cost_usd, actual_cost_usd
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                "codex-invalid-actual",
+                "gpt-5.4",
+                "openai-codex",
+                "codex_responses",
+                "included",
+                1_700_000_000.0_f64,
+                1_i32,
+                10_i64,
+                0_i64,
+                0_i64,
+                0_i64,
+                0_i64,
+                Some(0.6_f64),
+                Some(-1.0_f64),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let messages = parse_hermes_sqlite(&db_path);
+        assert_eq!(messages.len(), 1);
+        let msg = &messages[0];
+        assert_eq!(msg.session_id, "codex-invalid-actual");
+        assert_ne!(
+            msg.cost_source,
+            crate::sessions::CostSource::SubscriptionIncluded
+        );
+        assert_eq!(msg.cost_source, crate::sessions::CostSource::Estimated);
+        assert_eq!(msg.cost, 0.6);
+    }
+
+    #[test]
+    fn test_openai_codex_codex_responses_non_included_is_not_subscription() {
+        let (_dir, db_path) = create_test_db();
+        let conn = Connection::open(&db_path).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (
+                id, model, billing_provider, billing_mode, cost_status,
+                started_at, message_count, input_tokens, output_tokens,
+                cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                estimated_cost_usd, actual_cost_usd
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+            params![
+                "codex-responses-unknown",
+                "gpt-5.4",
+                "openai-codex",
+                "codex_responses",
+                "unknown",
+                1_700_000_000.0_f64,
+                1_i32,
+                10_i64,
+                0_i64,
+                0_i64,
+                0_i64,
+                0_i64,
+                Some(0.0_f64),
+                Option::<f64>::None,
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let messages = parse_hermes_sqlite(&db_path);
+        assert_eq!(messages.len(), 1);
+        let msg = &messages[0];
+        assert_eq!(msg.session_id, "codex-responses-unknown");
+        // Must NOT be treated as subscription-included; falls through to estimated.
+        assert_ne!(
+            msg.cost_source,
+            crate::sessions::CostSource::SubscriptionIncluded
+        );
+        assert_eq!(msg.cost_source, crate::sessions::CostSource::Estimated);
+        assert_eq!(msg.cost, 0.0);
+        assert_eq!(msg.provider_id, "openai");
     }
 }

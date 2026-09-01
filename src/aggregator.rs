@@ -314,6 +314,7 @@ impl DayAccumulator {
                 provider_id: msg.provider_id.clone(),
                 tokens: TokenBreakdown::default(),
                 cost: 0.0,
+                list_price_equivalent_cost: 0.0,
                 messages: 0,
             });
 
@@ -341,6 +342,8 @@ impl DayAccumulator {
             .reasoning
             .saturating_add(msg.tokens.reasoning);
         client_entry.cost += msg.cost;
+        client_entry.list_price_equivalent_cost +=
+            crate::list_price_equivalent_cost_for_message(msg);
         client_entry.messages = client_entry
             .messages
             .saturating_add(msg.message_count.max(0));
@@ -395,6 +398,7 @@ impl DayAccumulator {
                     provider_id: client_contrib.provider_id.clone(),
                     tokens: TokenBreakdown::default(),
                     cost: 0.0,
+                    list_price_equivalent_cost: 0.0,
                     messages: 0,
                 });
 
@@ -426,6 +430,7 @@ impl DayAccumulator {
                 .reasoning
                 .saturating_add(client_contrib.tokens.reasoning);
             entry.cost += client_contrib.cost;
+            entry.list_price_equivalent_cost += client_contrib.list_price_equivalent_cost;
             entry.messages = entry.messages.saturating_add(client_contrib.messages);
         }
 
@@ -563,6 +568,7 @@ impl SessionAccumulator {
                 provider_id: msg.provider_id.clone(),
                 tokens: TokenBreakdown::default(),
                 cost: 0.0,
+                list_price_equivalent_cost: 0.0,
                 messages: 0,
             });
         client_entry.tokens.input = client_entry.tokens.input.saturating_add(msg.tokens.input);
@@ -580,6 +586,8 @@ impl SessionAccumulator {
             .reasoning
             .saturating_add(msg.tokens.reasoning);
         client_entry.cost += msg.cost;
+        client_entry.list_price_equivalent_cost +=
+            crate::list_price_equivalent_cost_for_message(msg);
         client_entry.messages = client_entry
             .messages
             .saturating_add(msg.message_count.max(0));
@@ -642,6 +650,7 @@ impl SessionAccumulator {
                     provider_id: contrib.provider_id.clone(),
                     tokens: TokenBreakdown::default(),
                     cost: 0.0,
+                    list_price_equivalent_cost: 0.0,
                     messages: 0,
                 });
             entry.tokens.input = entry.tokens.input.saturating_add(contrib.tokens.input);
@@ -659,6 +668,7 @@ impl SessionAccumulator {
                 .reasoning
                 .saturating_add(contrib.tokens.reasoning);
             entry.cost += contrib.cost;
+            entry.list_price_equivalent_cost += contrib.list_price_equivalent_cost;
             entry.messages = entry.messages.saturating_add(contrib.messages);
 
             if entry.cost > self.top_cost {
@@ -1969,6 +1979,7 @@ mod tests {
                     reasoning: 40,
                 },
                 cost: 0.0123,
+                list_price_equivalent_cost: 0.0123,
                 messages: 12,
             }],
             first_seen: 1_715_551_577,
@@ -2054,7 +2065,11 @@ mod tests {
         }
         let contributions = agg.finalize();
 
-        assert_eq!(contributions.len(), 1, "all msgs on same date -> 1 day bucket");
+        assert_eq!(
+            contributions.len(),
+            1,
+            "all msgs on same date -> 1 day bucket"
+        );
         assert_eq!(
             contributions[0].totals.messages, 3,
             "all 3 messages with no dedup_key must be retained"
@@ -2190,20 +2205,48 @@ mod tests {
     fn test_streaming_aggregator_multi_day_bucketing_produces_separate_buckets() {
         // scenario: multi_day_bucketing
         let day1a = streaming_msg(
-            "2025-04-01", "opencode", "gpt-4o", "sess-d1", None,
-            1_743_000_000_000, 100, 50, 0.01,
+            "2025-04-01",
+            "opencode",
+            "gpt-4o",
+            "sess-d1",
+            None,
+            1_743_000_000_000,
+            100,
+            50,
+            0.01,
         );
         let day1b = streaming_msg(
-            "2025-04-01", "opencode", "gpt-4o", "sess-d1", None,
-            1_743_000_001_000, 200, 100, 0.02,
+            "2025-04-01",
+            "opencode",
+            "gpt-4o",
+            "sess-d1",
+            None,
+            1_743_000_001_000,
+            200,
+            100,
+            0.02,
         );
         let day2 = streaming_msg(
-            "2025-04-02", "opencode", "gpt-4o", "sess-d2", None,
-            1_743_086_400_000, 400, 200, 0.04,
+            "2025-04-02",
+            "opencode",
+            "gpt-4o",
+            "sess-d2",
+            None,
+            1_743_086_400_000,
+            400,
+            200,
+            0.04,
         );
         let day3 = streaming_msg(
-            "2025-04-03", "codex", "gpt-5", "sess-d3", None,
-            1_743_172_800_000, 1000, 500, 0.10,
+            "2025-04-03",
+            "codex",
+            "gpt-5",
+            "sess-d3",
+            None,
+            1_743_172_800_000,
+            1000,
+            500,
+            0.10,
         );
 
         let mut agg = StreamingAggregator::new();
@@ -2233,20 +2276,48 @@ mod tests {
     fn test_streaming_aggregator_store_memo_snapshot_hermes_zed_dedup() {
         // scenario: store_memo_snapshot
         let hermes_msg = streaming_msg(
-            "2025-05-01", "hermes", "claude-sonnet-4-5", "hermes-sess-1",
-            Some("hermes-unique-key-1"), 1_746_000_000_000, 500, 200, 0.09,
+            "2025-05-01",
+            "hermes",
+            "claude-sonnet-4-5",
+            "hermes-sess-1",
+            Some("hermes-unique-key-1"),
+            1_746_000_000_000,
+            500,
+            200,
+            0.09,
         );
         let zed_msg = streaming_msg(
-            "2025-05-01", "zed", "claude-sonnet-4-5", "zed-sess-1",
-            Some("zed-unique-key-1"), 1_746_000_001_000, 300, 100, 0.05,
+            "2025-05-01",
+            "zed",
+            "claude-sonnet-4-5",
+            "zed-sess-1",
+            Some("zed-unique-key-1"),
+            1_746_000_001_000,
+            300,
+            100,
+            0.05,
         );
         let normal_msg = streaming_msg(
-            "2025-05-01", "claude", "claude-haiku-4-5", "claude-sess-1",
-            None, 1_746_000_002_000, 100, 50, 0.01,
+            "2025-05-01",
+            "claude",
+            "claude-haiku-4-5",
+            "claude-sess-1",
+            None,
+            1_746_000_002_000,
+            100,
+            50,
+            0.01,
         );
         let hermes_dup = streaming_msg(
-            "2025-05-01", "hermes", "claude-sonnet-4-5", "hermes-sess-1",
-            Some("hermes-unique-key-1"), 1_746_000_003_000, 500, 200, 0.09,
+            "2025-05-01",
+            "hermes",
+            "claude-sonnet-4-5",
+            "hermes-sess-1",
+            Some("hermes-unique-key-1"),
+            1_746_000_003_000,
+            500,
+            200,
+            0.09,
         );
 
         let mut agg = StreamingAggregator::new();
@@ -2278,5 +2349,4 @@ mod tests {
             "finalize() on empty StreamingAggregator must return empty Vec without panicking"
         );
     }
-
 }
