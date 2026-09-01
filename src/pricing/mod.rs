@@ -4,6 +4,7 @@ pub mod custom;
 pub mod litellm;
 pub mod lookup;
 pub mod openrouter;
+pub(crate) mod opencode_go;
 
 use custom::CustomPricing;
 use lookup::{
