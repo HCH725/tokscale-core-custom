@@ -4556,6 +4556,21 @@ fn apply_pricing_if_available(
         return;
     }
 
+    if matches!(
+        message.provider_id.trim().to_ascii_lowercase().as_str(),
+        "opencode-go" | "opencode_go"
+    ) {
+        if let Some(cost) = pricing::opencode_go::estimate_cost(
+            &message.model_id,
+            message.timestamp,
+            &message.tokens,
+        ) {
+            message.cost = cost;
+            message.mark_estimated_cost();
+            return;
+        }
+    }
+
     let Some(pricing) = pricing else {
         return;
     };
@@ -13771,6 +13786,79 @@ mod tests {
         apply_pricing_if_available(&mut msg, Some(&pricing));
 
         assert_eq!(msg.cost, 0.42);
+        assert_eq!(msg.cost_source, CostSource::ProviderReported);
+    }
+
+    #[test]
+    fn test_apply_pricing_if_available_uses_official_opencode_go_pricing_without_catalog() {
+        let mut msg = UnifiedMessage::new(
+            "hermes",
+            "mimo-v2.5",
+            "opencode-go",
+            "session-go",
+            1_788_255_600_000,
+            TokenBreakdown {
+                input: 1_000_000,
+                output: 1_000_000,
+                cache_read: 1_000_000,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.0,
+        );
+
+        apply_pricing_if_available(&mut msg, None);
+
+        assert!((msg.cost - (0.14 + 0.28 + 0.0028)).abs() < 1e-12);
+        assert_eq!(msg.cost_source, CostSource::Estimated);
+    }
+
+    #[test]
+    fn test_apply_pricing_if_available_scopes_opencode_go_override_to_provider() {
+        let mut msg = UnifiedMessage::new(
+            "hermes",
+            "mimo-v2.5",
+            "openrouter",
+            "session-router",
+            1_788_255_600_000,
+            TokenBreakdown {
+                input: 1_000_000,
+                output: 1_000_000,
+                cache_read: 1_000_000,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.0,
+        );
+
+        apply_pricing_if_available(&mut msg, None);
+
+        assert_eq!(msg.cost, 0.0);
+        assert_eq!(msg.cost_source, CostSource::Unknown);
+    }
+
+    #[test]
+    fn test_apply_pricing_if_available_preserves_opencode_go_provider_reported_cost() {
+        let mut msg = UnifiedMessage::new(
+            "hermes",
+            "mimo-v2.5",
+            "opencode-go",
+            "session-go-authoritative",
+            1_788_255_600_000,
+            TokenBreakdown {
+                input: 1_000_000,
+                output: 1_000_000,
+                cache_read: 1_000_000,
+                cache_write: 0,
+                reasoning: 0,
+            },
+            0.77,
+        );
+        msg.mark_provider_reported_cost();
+
+        apply_pricing_if_available(&mut msg, None);
+
+        assert_eq!(msg.cost, 0.77);
         assert_eq!(msg.cost_source, CostSource::ProviderReported);
     }
 
