@@ -32,6 +32,12 @@ The Hermes source lane must:
 
 The v1 ledger is intentionally append-only and unrotated. A linear scan is accepted for this small local source; do not add a database, rotation service, or background index until measured ledger size/latency justifies it.
 
+### OpenCode Go pricing
+
+Hermes usage attributed to `provider=opencode-go` (or normalized `opencode_go`) uses OpenCode Go's official usage-value pricing before the generic pricing catalog. The adapter is provider-scoped, preserves provider-reported cost as authoritative, and falls back to the existing pricing service for unknown Go models.
+
+Current covered Go models are `mimo-v2.5`, `mimo-v2.5-pro`, `muse-spark-1.2-contributor`, `deepseek-v4-pro`, `deepseek-v4-flash`, and `deepseek-v4-flash-vision-exp`. DeepSeek V4 applies the official weekday UTC peak windows `[01:00,04:00)` and `[06:00,10:00)`; weekends and all other times are off-peak. Hermes `output_tokens` already represents billable completion output, so the separate `reasoning_tokens` field must not be charged again on this path. Pricing source: `https://opencode.ai/docs/go/`.
+
 ## Update workflow
 
 When the upstream core revision used by TokenBar changes, start from that new upstream revision, re-evaluate whether this custom parser is still needed, port only the minimum surviving delta, run `git diff --check` and the complete `cargo test` suite, then update TokenBar's submodule pointer only after review/audit.
