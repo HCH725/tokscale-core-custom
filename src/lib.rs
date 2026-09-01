@@ -1937,8 +1937,17 @@ fn parse_all_messages_with_pricing_with_env_strategy(
     }
     if let Some(path) = &scan_result.catdesk_usage_ledger {
         all_messages.extend(
-            sessions::hermes::parse_catdesk_usage_jsonl(path)
+            sessions::hermes::parse_catdesk_usage_jsonl_with_pricing_identity(path)
                 .into_iter()
+                .map(|parsed| {
+                    let mut message = parsed.message;
+                    apply_pricing_identity_if_available(
+                        &mut message,
+                        pricing,
+                        &parsed.pricing_model,
+                    );
+                    message
+                })
                 .filter(|message| should_keep_deduped_message(&mut hermes_seen, message)),
         );
     }
@@ -4055,7 +4064,9 @@ where
             }
         }
         if let Some(path) = &scan_result.catdesk_usage_ledger {
-            for m in sessions::hermes::parse_catdesk_usage_jsonl(path) {
+            for parsed in sessions::hermes::parse_catdesk_usage_jsonl_with_pricing_identity(path) {
+                let mut m = parsed.message;
+                apply_pricing_identity_if_available(&mut m, pricing, &parsed.pricing_model);
                 if !passes_client(&m) { continue; }
                 let keep = m.dedup_key.as_ref().is_none_or(|k| k.is_empty() || dedup_gate_passes(k, &mut hermes_seen));
                 if keep && filter(&m) { sink(&m); }
@@ -4579,6 +4590,41 @@ fn apply_pricing_if_available(
 /// recomputed `tokens * rate` never clobbers the authoritative value if the
 /// model later resolves to a price. Every other lane passes `false` and
 /// reprices unconditionally (unchanged behaviour). `#742` Part 2.
+fn apply_pricing_identity_if_available(
+    message: &mut UnifiedMessage,
+    pricing: Option<&pricing::PricingService>,
+    pricing_model_id: &str,
+) {
+    if message.has_authoritative_cost() {
+        return;
+    }
+
+    let Some(pricing) = pricing else {
+        return;
+    };
+    let pricing_provider = provider_identity::inferred_provider_from_model(pricing_model_id);
+    let Some(estimate) = pricing.estimate_cost_with_provider(
+        pricing_model_id,
+        pricing_provider,
+        &message.tokens,
+    ) else {
+        return;
+    };
+    let calculated_cost = estimate.cost * pricing_multiplier(message);
+
+    match estimate.coverage {
+        pricing::lookup::EstimateCoverage::Complete => {
+            message.cost = calculated_cost;
+            message.mark_estimated_cost();
+        }
+        pricing::lookup::EstimateCoverage::Partial => {
+            message.cost = calculated_cost;
+            message.mark_partially_estimated_cost();
+        }
+        pricing::lookup::EstimateCoverage::None => {}
+    }
+}
+
 fn reprice_lane_message(
     message: &mut UnifiedMessage,
     pricing: Option<&pricing::PricingService>,
@@ -5838,8 +5884,9 @@ mod tests {
     #[cfg(unix)]
     use super::copilot_desktop_source_mtime_ms;
     use super::{
-        agent_bucket_key, aggregate_model_usage_entries, apply_pricing_if_available,
-        canonical_model_id, clear_model_aliases, coverage_for_messages, dedupe_latest_trae_messages,
+        agent_bucket_key, aggregate_model_usage_entries, apply_pricing_identity_if_available,
+        apply_pricing_if_available, canonical_model_id, clear_model_aliases, coverage_for_messages,
+        dedupe_latest_trae_messages,
         fold_messages_streaming, get_agents_report, get_hourly_report, get_model_report,
         get_monthly_report, latest_source_mtime_ms, local_source_change_token, message_cache,
         model_alias_generation, normalize_model_for_grouping, normalize_syntactic,
@@ -14926,8 +14973,8 @@ mod tests {
                 .iter()
                 .all(|message| message.model_id == "catdesk-mcp")
         );
-        assert_eq!(counted.messages.iter().map(|message| message.input).sum::<i64>(), 17);
-        assert_eq!(counted.messages.iter().map(|message| message.output).sum::<i64>(), 15);
+        assert_eq!(counted.messages.iter().map(|message| message.input).sum::<i64>(), 15);
+        assert_eq!(counted.messages.iter().map(|message| message.output).sum::<i64>(), 17);
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -14943,16 +14990,55 @@ mod tests {
                 }))
                 .unwrap()
         });
-        assert_eq!(report.total_input, 17);
-        assert_eq!(report.total_output, 15);
+        assert_eq!(report.total_input, 15);
+        assert_eq!(report.total_output, 17);
         assert_eq!(report.total_messages, 2);
         assert_eq!(report.entries.len(), 1);
         assert_eq!(report.entries[0].client, "hermes");
         assert_eq!(report.entries[0].model, "catdesk-mcp");
         assert_eq!(report.entries[0].provider, "catdesk");
-        assert_eq!(report.entries[0].input, 17);
-        assert_eq!(report.entries[0].output, 15);
-        assert_eq!(report.total_cost, 0.0);
+        assert_eq!(report.entries[0].input, 15);
+        assert_eq!(report.entries[0].output, 17);
+    }
+
+    #[test]
+    fn test_catdesk_pricing_identity_prices_reversed_mcp_tokens_without_relabeling_source() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let catdesk_dir = source_home.path().join(".catdesk");
+        std::fs::create_dir_all(&catdesk_dir).unwrap();
+        let ledger_path = catdesk_dir.join("usage.jsonl");
+        std::fs::write(
+            &ledger_path,
+            "{\"eventId\":\"evt-price\",\"timestampMs\":1788210000123,\"inputTokens\":12,\"outputTokens\":8,\"bucket\":\"through-gpt-5.6\",\"pricingModel\":\"gpt-5.6-sol\"}\n",
+        )
+        .unwrap();
+
+        let mut parsed = sessions::hermes::parse_catdesk_usage_jsonl_with_pricing_identity(&ledger_path);
+        assert_eq!(parsed.len(), 1);
+        let parsed = parsed.pop().unwrap();
+        assert_eq!(parsed.pricing_model, "gpt-5.6-sol");
+        assert_eq!(parsed.message.tokens.input, 8);
+        assert_eq!(parsed.message.tokens.output, 12);
+
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gpt-5.6-sol".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.000004),
+                output_cost_per_token: Some(0.000020),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let mut message = parsed.message;
+        apply_pricing_identity_if_available(&mut message, Some(&pricing), &parsed.pricing_model);
+
+        assert_eq!(message.client, "hermes");
+        assert_eq!(message.model_id, "catdesk-mcp");
+        assert_eq!(message.provider_id, "catdesk");
+        let expected = 8.0 * 0.000004 + 12.0 * 0.000020;
+        assert!((message.cost - expected).abs() < 1e-12);
+        assert_eq!(message.cost_source, CostSource::Estimated);
     }
 
     #[test]
