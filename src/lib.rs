@@ -389,6 +389,8 @@ pub struct ClientContribution {
     pub provider_id: String,
     pub tokens: TokenBreakdown,
     pub cost: f64,
+    /// Separate rate-card equivalent for subscription attribution views.
+    pub list_price_equivalent_cost: f64,
     pub messages: i32,
 }
 
@@ -584,6 +586,9 @@ pub struct ModelUsage {
     pub reasoning: i64,
     pub message_count: i32,
     pub cost: f64,
+    /// Work/Codex token-rate equivalent for attribution/quota views. This is
+    /// deliberately separate from provider-reported subscription cost.
+    pub list_price_equivalent_cost: f64,
     pub performance: ModelPerformance,
 }
 
@@ -2185,6 +2190,17 @@ fn workspace_bucket(msg: &UnifiedMessage) -> (String, Option<String>, String) {
     }
 }
 
+pub(crate) fn list_price_equivalent_cost_for_message(message: &UnifiedMessage) -> f64 {
+    if message.client == "hermes"
+        && message.provider_id.eq_ignore_ascii_case("openai")
+        && message.cost_source == CostSource::SubscriptionIncluded
+    {
+        return pricing::codex_chatgpt::estimate_cost(&message.model_id, &message.tokens)
+            .unwrap_or(0.0);
+    }
+    message.cost
+}
+
 fn aggregate_model_usage_entries(
     messages: Vec<UnifiedMessage>,
     group_by: &GroupBy,
@@ -2242,6 +2258,7 @@ fn aggregate_model_usage_entries(
             reasoning: 0,
             message_count: 0,
             cost: 0.0,
+            list_price_equivalent_cost: 0.0,
             performance: ModelPerformance::default(),
         });
 
@@ -2272,6 +2289,7 @@ fn aggregate_model_usage_entries(
         entry.reasoning = entry.reasoning.saturating_add(msg.tokens.reasoning);
         entry.message_count += msg.message_count.max(0);
         entry.cost += msg.cost;
+        entry.list_price_equivalent_cost += list_price_equivalent_cost_for_message(&msg);
         entry
             .performance
             .record_message(positive_token_total(&msg.tokens), msg.duration_ms);
@@ -4280,18 +4298,20 @@ struct CostCoverageFold {
 impl CostCoverageFold {
     fn observe(&mut self, message: &UnifiedMessage) {
         // Structural rows (no usage and no cost authority) do not affect
-        // coverage. ProviderReported remains relevant even at a legitimate
-        // zero cost; CostSource is the provenance source of truth.
+        // coverage. An authoritative zero (provider-reported or subscription-
+        // included) remains relevant; CostSource is the provenance source of truth.
         let cost_relevant = message.tokens.total() > 0
             || message.message_count > 0
             || message.cost > 0.0
-            || message.cost_source == CostSource::ProviderReported;
+            || message.has_authoritative_cost();
         if !cost_relevant {
             return;
         }
 
         match message.cost_source {
-            CostSource::ProviderReported | CostSource::Estimated => self.known = true,
+            CostSource::ProviderReported
+            | CostSource::SubscriptionIncluded
+            | CostSource::Estimated => self.known = true,
             CostSource::PartiallyEstimated => {
                 self.known = true;
                 self.unknown = true;
@@ -6139,6 +6159,52 @@ mod tests {
             CostCoverage::Partial
         );
         assert_eq!(coverage_for_messages([&structural]), CostCoverage::Complete);
+    }
+
+    #[test]
+    fn hermes_codex_subscription_included_gets_recorded_model_rate_card_equivalent() {
+        let mut message = UnifiedMessage::new(
+            "hermes",
+            "gpt-5.4",
+            "openai",
+            "session-codex",
+            1_788_240_000_000,
+            TokenBreakdown {
+                input: 1_000_000,
+                output: 1_000_000,
+                cache_read: 1_000_000,
+                cache_write: 1_000_000,
+                reasoning: 1_000_000,
+            },
+            0.0,
+        );
+        message.mark_subscription_included_cost();
+
+        assert_eq!(message.cost, 0.0);
+        assert!((super::list_price_equivalent_cost_for_message(&message) - 17.75).abs() < 1e-12);
+
+        let entries = aggregate_model_usage_entries(vec![message], &GroupBy::ClientProviderModel);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].cost, 0.0);
+        assert!((entries[0].list_price_equivalent_cost - 17.75).abs() < 1e-12);
+    }
+
+    #[test]
+    fn list_price_equivalent_does_not_reprice_openai_api_reported_zero() {
+        let mut message = UnifiedMessage::new(
+            "hermes",
+            "gpt-5.4",
+            "openai",
+            "session-api",
+            1_788_240_000_000,
+            TokenBreakdown {
+                input: 1_000_000,
+                ..Default::default()
+            },
+            0.0,
+        );
+        message.cost_source = CostSource::ProviderReported;
+        assert_eq!(super::list_price_equivalent_cost_for_message(&message), 0.0);
     }
 
     #[test]
@@ -8714,6 +8780,7 @@ mod tests {
         );
         match source {
             CostSource::ProviderReported => message.mark_provider_reported_cost(),
+            CostSource::SubscriptionIncluded => message.mark_subscription_included_cost(),
             CostSource::Estimated => message.mark_estimated_cost(),
             CostSource::PartiallyEstimated => message.mark_partially_estimated_cost(),
             CostSource::Unknown => {}
@@ -9122,6 +9189,8 @@ mod tests {
                 cache_write_tokens INTEGER DEFAULT 0,
                 reasoning_tokens INTEGER DEFAULT 0,
                 billing_provider TEXT,
+                billing_mode TEXT,
+                cost_status TEXT,
                 estimated_cost_usd REAL,
                 actual_cost_usd REAL
             );",
@@ -19740,6 +19809,7 @@ pub struct WindowMessage {
     pub cache_write: i64,
     pub reasoning: i64,
     pub cost: f64,
+    pub list_price_equivalent_cost: f64,
     pub is_turn_start: bool,
 }
 
@@ -19799,6 +19869,7 @@ pub async fn get_window_usage(
                 cache_write: msg.tokens.cache_write,
                 reasoning: msg.tokens.reasoning,
                 cost: msg.cost,
+                list_price_equivalent_cost: list_price_equivalent_cost_for_message(msg),
                 is_turn_start: msg.is_turn_start,
             });
         },

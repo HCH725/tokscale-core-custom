@@ -47,6 +47,10 @@ pub enum CostSource {
     #[default]
     Unknown,
     ProviderReported,
+    /// Provider confirms this usage is covered by a subscription rather than
+    /// incrementally billed. The authoritative raw cost is therefore zero;
+    /// consumers may derive a separate rate-card equivalent without mutating it.
+    SubscriptionIncluded,
     Estimated,
     PartiallyEstimated,
 }
@@ -382,6 +386,11 @@ impl UnifiedMessage {
         self.cost_source = CostSource::ProviderReported;
     }
 
+    pub(crate) fn mark_subscription_included_cost(&mut self) {
+        self.cost = 0.0;
+        self.cost_source = CostSource::SubscriptionIncluded;
+    }
+
     pub(crate) fn mark_estimated_cost(&mut self) {
         self.cost_source = CostSource::Estimated;
     }
@@ -391,7 +400,10 @@ impl UnifiedMessage {
     }
 
     pub(crate) fn has_authoritative_cost(&self) -> bool {
-        self.cost_source == CostSource::ProviderReported
+        matches!(
+            self.cost_source,
+            CostSource::ProviderReported | CostSource::SubscriptionIncluded
+        )
     }
 }
 

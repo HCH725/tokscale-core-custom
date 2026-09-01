@@ -19,6 +19,8 @@ fn create_test_db(dir: &TempDir) -> std::path::PathBuf {
             cache_write_tokens INTEGER DEFAULT 0,
             reasoning_tokens INTEGER DEFAULT 0,
             billing_provider TEXT,
+            billing_mode TEXT,
+            cost_status TEXT,
             estimated_cost_usd REAL,
             actual_cost_usd REAL
         );
