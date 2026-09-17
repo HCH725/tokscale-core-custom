@@ -514,6 +514,8 @@ pub struct ClientContribution {
     pub provider_id: String,
     pub tokens: TokenBreakdown,
     pub cost: f64,
+    /// Separate rate-card equivalent for subscription attribution views.
+    pub list_price_equivalent_cost: f64,
     pub messages: i32,
 }
 
@@ -709,6 +711,9 @@ pub struct ModelUsage {
     pub reasoning: i64,
     pub message_count: i32,
     pub cost: f64,
+    /// Work/Codex token-rate equivalent for attribution/quota views. This is
+    /// deliberately separate from provider-reported subscription cost.
+    pub list_price_equivalent_cost: f64,
     pub performance: ModelPerformance,
 }
 
@@ -785,6 +790,9 @@ pub struct WindowMessage {
     pub cache_write: i64,
     pub reasoning: i64,
     pub cost: f64,
+    /// Separate ChatGPT Work/Codex rate-card equivalent used only by
+    /// attribution and quota views; it never changes provider-reported cost.
+    pub list_price_equivalent_cost: f64,
     pub is_turn_start: bool,
 }
 
@@ -2090,6 +2098,22 @@ fn parse_all_messages_with_pricing_with_env_strategy(
                 .filter(|message| should_keep_deduped_message(&mut hermes_seen, message)),
         );
     }
+    if let Some(path) = &scan_result.catdesk_usage_ledger {
+        all_messages.extend(
+            sessions::hermes::parse_catdesk_usage_jsonl_with_pricing_identity(path)
+                .into_iter()
+                .map(|parsed| {
+                    let mut message = parsed.message;
+                    apply_pricing_identity_if_available(
+                        &mut message,
+                        pricing,
+                        &parsed.pricing_model,
+                    );
+                    message
+                })
+                .filter(|message| should_keep_deduped_message(&mut hermes_seen, message)),
+        );
+    }
 
     if let Some(db_path) = &scan_result.goose_db {
         let goose_messages: Vec<UnifiedMessage> = sessions::goose::parse_goose_sqlite(db_path)
@@ -2324,6 +2348,17 @@ fn workspace_bucket(msg: &UnifiedMessage) -> (String, Option<String>, String) {
     }
 }
 
+pub(crate) fn list_price_equivalent_cost_for_message(message: &UnifiedMessage) -> f64 {
+    if message.client == "hermes"
+        && message.provider_id.eq_ignore_ascii_case("openai")
+        && message.cost_source == CostSource::SubscriptionIncluded
+    {
+        return pricing::codex_chatgpt::estimate_cost(&message.model_id, &message.tokens)
+            .unwrap_or(0.0);
+    }
+    message.cost
+}
+
 fn aggregate_model_usage_entries(
     messages: Vec<UnifiedMessage>,
     group_by: &GroupBy,
@@ -2381,6 +2416,7 @@ fn aggregate_model_usage_entries(
             reasoning: 0,
             message_count: 0,
             cost: 0.0,
+            list_price_equivalent_cost: 0.0,
             performance: ModelPerformance::default(),
         });
 
@@ -2411,6 +2447,7 @@ fn aggregate_model_usage_entries(
         entry.reasoning = entry.reasoning.saturating_add(msg.tokens.reasoning);
         entry.message_count += msg.message_count.max(0);
         entry.cost += msg.cost;
+        entry.list_price_equivalent_cost += list_price_equivalent_cost_for_message(&msg);
         entry
             .performance
             .record_message(positive_token_total(&msg.tokens), msg.duration_ms);
@@ -3531,6 +3568,7 @@ async fn get_window_usage_inner(
             cache_write: msg.tokens.cache_write,
             reasoning: msg.tokens.reasoning,
             cost: msg.cost,
+            list_price_equivalent_cost: list_price_equivalent_cost_for_message(msg),
             is_turn_start: msg.is_turn_start,
         });
     };
@@ -4605,7 +4643,7 @@ where
         }
     }
 
-    // ---- Hermes SQLite (own dedup set) ----
+    // ---- Hermes SQLite + CatDesk usage ledger (own dedup set) ----
     {
         let mut hermes_seen: HashSet<String> = HashSet::new();
         for db_path in scan_result.hermes_db_paths() {
@@ -4620,6 +4658,15 @@ where
                 if keep && filter(&m) {
                     sink(&m);
                 }
+            }
+        }
+        if let Some(path) = &scan_result.catdesk_usage_ledger {
+            for parsed in sessions::hermes::parse_catdesk_usage_jsonl_with_pricing_identity(path) {
+                let mut m = parsed.message;
+                apply_pricing_identity_if_available(&mut m, pricing, &parsed.pricing_model);
+                if !passes_client(&m) { continue; }
+                let keep = m.dedup_key.as_ref().is_none_or(|k| k.is_empty() || dedup_gate_passes(k, &mut hermes_seen));
+                if keep && filter(&m) { sink(&m); }
             }
         }
     }
@@ -4870,18 +4917,20 @@ struct CostCoverageFold {
 impl CostCoverageFold {
     fn observe(&mut self, message: &UnifiedMessage) {
         // Structural rows (no usage and no cost authority) do not affect
-        // coverage. ProviderReported remains relevant even at a legitimate
-        // zero cost; CostSource is the provenance source of truth.
+        // coverage. An authoritative zero (provider-reported or subscription-
+        // included) remains relevant; CostSource is the provenance source of truth.
         let cost_relevant = message.tokens.total() > 0
             || message.message_count > 0
             || message.cost > 0.0
-            || message.cost_source == CostSource::ProviderReported;
+            || message.has_authoritative_cost();
         if !cost_relevant {
             return;
         }
 
         match message.cost_source {
-            CostSource::ProviderReported | CostSource::Estimated => self.known = true,
+            CostSource::ProviderReported
+            | CostSource::SubscriptionIncluded
+            | CostSource::Estimated => self.known = true,
             CostSource::PartiallyEstimated => {
                 self.known = true;
                 self.unknown = true;
@@ -5232,6 +5281,21 @@ fn apply_pricing_if_available(
         return;
     }
 
+    if matches!(
+        message.provider_id.trim().to_ascii_lowercase().as_str(),
+        "opencode-go" | "opencode_go"
+    ) {
+        if let Some(cost) = pricing::opencode_go::estimate_cost(
+            &message.model_id,
+            message.timestamp,
+            &message.tokens,
+        ) {
+            message.cost = cost;
+            message.mark_estimated_cost();
+            return;
+        }
+    }
+
     let Some(pricing) = pricing else {
         return;
     };
@@ -5266,6 +5330,41 @@ fn apply_pricing_if_available(
 /// recomputed `tokens * rate` never clobbers the authoritative value if the
 /// model later resolves to a price. Every other lane passes `false` and
 /// reprices unconditionally (unchanged behaviour). `#742` Part 2.
+fn apply_pricing_identity_if_available(
+    message: &mut UnifiedMessage,
+    pricing: Option<&pricing::PricingService>,
+    pricing_model_id: &str,
+) {
+    if message.has_authoritative_cost() {
+        return;
+    }
+
+    let Some(pricing) = pricing else {
+        return;
+    };
+    let pricing_provider = provider_identity::inferred_provider_from_model(pricing_model_id);
+    let Some(estimate) = pricing.estimate_cost_with_provider(
+        pricing_model_id,
+        pricing_provider,
+        &message.tokens,
+    ) else {
+        return;
+    };
+    let calculated_cost = estimate.cost * pricing_multiplier(message);
+
+    match estimate.coverage {
+        pricing::lookup::EstimateCoverage::Complete => {
+            message.cost = calculated_cost;
+            message.mark_estimated_cost();
+        }
+        pricing::lookup::EstimateCoverage::Partial => {
+            message.cost = calculated_cost;
+            message.mark_partially_estimated_cost();
+        }
+        pricing::lookup::EstimateCoverage::None => {}
+    }
+}
+
 fn reprice_lane_message(
     message: &mut UnifiedMessage,
     pricing: Option<&pricing::PricingService>,
@@ -5422,6 +5521,9 @@ fn latest_source_mtime_ms_from_scan(scan_result: &scanner::ScanResult) -> u64 {
     // scan roots (the `files` lanes) — use the plural helpers so every db gets
     // its `-wal` sidecar probed, not just the default-path single.
     dbs.extend(scan_result.hermes_db_paths());
+    if let Some(path) = &scan_result.catdesk_usage_ledger {
+        latest = latest.max(file_mtime_ms(path).unwrap_or(0));
+    }
     dbs.extend(scan_result.zed_db_paths());
     dbs.extend(scan_result.crush_dbs.iter().map(|c| c.db_path.clone()));
     // Antigravity CLI conversation `.db` files arrive via the generic `files`
@@ -5530,6 +5632,9 @@ fn local_source_change_token_inner(scan_result: &scanner::ScanResult) -> Result<
     ];
     dbs.extend(single_dbs.into_iter().flatten().cloned());
     dbs.extend(scan_result.hermes_db_paths());
+    if let Some(path) = &scan_result.catdesk_usage_ledger {
+        paths.push(path.clone());
+    }
     dbs.extend(scan_result.zed_db_paths());
     dbs.extend(
         scan_result
@@ -6315,14 +6420,22 @@ fn parse_local_clients_inner(
     };
 
     let hermes_db_paths = scan_result.hermes_db_paths();
-    if !hermes_db_paths.is_empty() {
+    if !hermes_db_paths.is_empty() || scan_result.catdesk_usage_ledger.is_some() {
         let mut hermes_seen: HashSet<String> = HashSet::new();
-        let hermes_msgs: Vec<ParsedMessage> = hermes_db_paths
+        let mut hermes_msgs: Vec<ParsedMessage> = hermes_db_paths
             .iter()
             .flat_map(|db_path| sessions::hermes::parse_hermes_sqlite(db_path))
             .filter(|msg| should_keep_deduped_message(&mut hermes_seen, msg))
             .map(|msg| unified_to_parsed(&msg))
             .collect();
+        if let Some(path) = &scan_result.catdesk_usage_ledger {
+            hermes_msgs.extend(
+                sessions::hermes::parse_catdesk_usage_jsonl(path)
+                    .into_iter()
+                    .filter(|msg| should_keep_deduped_message(&mut hermes_seen, msg))
+                    .map(|msg| unified_to_parsed(&msg)),
+            );
+        }
         let count = summed_parsed_message_count(&hermes_msgs);
         counts.set(ClientId::Hermes, count);
         messages.extend(hermes_msgs);
@@ -6604,8 +6717,8 @@ mod tests {
     #[cfg(unix)]
     use super::copilot_desktop_source_mtime_ms;
     use super::{
-        agent_bucket_key, aggregate_model_usage_entries, apply_pricing_if_available,
-        canonical_model_id, clear_model_aliases, coverage_for_messages,
+        agent_bucket_key, aggregate_model_usage_entries, apply_pricing_identity_if_available,
+        apply_pricing_if_available, canonical_model_id, clear_model_aliases, coverage_for_messages,
         dedupe_latest_trae_messages, fold_messages_streaming, get_agents_report, get_hourly_report,
         get_model_report, get_model_report_with_source_context, get_monthly_report, get_window_usage,
         latest_source_mtime_ms, load_pricing_for_local_parse_with_context,
@@ -6895,6 +7008,53 @@ mod tests {
             CostCoverage::Partial
         );
         assert_eq!(coverage_for_messages([&structural]), CostCoverage::Complete);
+    }
+
+    #[test]
+    fn hermes_codex_subscription_included_gets_recorded_model_rate_card_equivalent() {
+        let mut message = UnifiedMessage::new(
+            "hermes",
+            "gpt-5.4",
+            "openai",
+            "session-codex",
+            1_788_240_000_000,
+            TokenBreakdown {
+                input: 1_000_000,
+                output: 1_000_000,
+                cache_read: 1_000_000,
+                cache_write: 1_000_000,
+                cache_write_1h: 0,
+                reasoning: 1_000_000,
+            },
+            0.0,
+        );
+        message.mark_subscription_included_cost();
+
+        assert_eq!(message.cost, 0.0);
+        assert!((super::list_price_equivalent_cost_for_message(&message) - 17.75).abs() < 1e-12);
+
+        let entries = aggregate_model_usage_entries(vec![message], &GroupBy::ClientProviderModel);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].cost, 0.0);
+        assert!((entries[0].list_price_equivalent_cost - 17.75).abs() < 1e-12);
+    }
+
+    #[test]
+    fn list_price_equivalent_does_not_reprice_openai_api_reported_zero() {
+        let mut message = UnifiedMessage::new(
+            "hermes",
+            "gpt-5.4",
+            "openai",
+            "session-api",
+            1_788_240_000_000,
+            TokenBreakdown {
+                input: 1_000_000,
+                ..Default::default()
+            },
+            0.0,
+        );
+        message.cost_source = CostSource::ProviderReported;
+        assert_eq!(super::list_price_equivalent_cost_for_message(&message), 0.0);
     }
 
     #[test]
@@ -10007,6 +10167,7 @@ mod tests {
         );
         match source {
             CostSource::ProviderReported => message.mark_provider_reported_cost(),
+            CostSource::SubscriptionIncluded => message.mark_subscription_included_cost(),
             CostSource::Estimated => message.mark_estimated_cost(),
             CostSource::PartiallyEstimated => message.mark_partially_estimated_cost(),
             CostSource::Unknown => {}
@@ -10570,6 +10731,8 @@ mod tests {
                 cache_write_tokens INTEGER DEFAULT 0,
                 reasoning_tokens INTEGER DEFAULT 0,
                 billing_provider TEXT,
+                billing_mode TEXT,
+                cost_status TEXT,
                 estimated_cost_usd REAL,
                 actual_cost_usd REAL
             );",
@@ -15475,6 +15638,82 @@ mod tests {
     }
 
     #[test]
+    fn test_apply_pricing_if_available_uses_official_opencode_go_pricing_without_catalog() {
+        let mut msg = UnifiedMessage::new(
+            "hermes",
+            "mimo-v2.5",
+            "opencode-go",
+            "session-go",
+            1_788_255_600_000,
+            TokenBreakdown {
+                input: 1_000_000,
+                output: 1_000_000,
+                cache_read: 1_000_000,
+                cache_write: 0,
+                cache_write_1h: 0,
+                reasoning: 0,
+            },
+            0.0,
+        );
+
+        apply_pricing_if_available(&mut msg, None);
+
+        assert!((msg.cost - (0.14 + 0.28 + 0.0028)).abs() < 1e-12);
+        assert_eq!(msg.cost_source, CostSource::Estimated);
+    }
+
+    #[test]
+    fn test_apply_pricing_if_available_scopes_opencode_go_override_to_provider() {
+        let mut msg = UnifiedMessage::new(
+            "hermes",
+            "mimo-v2.5",
+            "openrouter",
+            "session-router",
+            1_788_255_600_000,
+            TokenBreakdown {
+                input: 1_000_000,
+                output: 1_000_000,
+                cache_read: 1_000_000,
+                cache_write: 0,
+                cache_write_1h: 0,
+                reasoning: 0,
+            },
+            0.0,
+        );
+
+        apply_pricing_if_available(&mut msg, None);
+
+        assert_eq!(msg.cost, 0.0);
+        assert_eq!(msg.cost_source, CostSource::Unknown);
+    }
+
+    #[test]
+    fn test_apply_pricing_if_available_preserves_opencode_go_provider_reported_cost() {
+        let mut msg = UnifiedMessage::new(
+            "hermes",
+            "mimo-v2.5",
+            "opencode-go",
+            "session-go-authoritative",
+            1_788_255_600_000,
+            TokenBreakdown {
+                input: 1_000_000,
+                output: 1_000_000,
+                cache_read: 1_000_000,
+                cache_write: 0,
+                cache_write_1h: 0,
+                reasoning: 0,
+            },
+            0.77,
+        );
+        msg.mark_provider_reported_cost();
+
+        apply_pricing_if_available(&mut msg, None);
+
+        assert_eq!(msg.cost, 0.77);
+        assert_eq!(msg.cost_source, CostSource::ProviderReported);
+    }
+
+    #[test]
     #[serial_test::serial]
     fn test_cost_provenance_matches_materialized_and_streaming_lanes() {
         let cache_home = tempfile::TempDir::new().unwrap();
@@ -16733,6 +16972,112 @@ mod tests {
         assert_eq!(counted.messages[0].session_id, "hermes-auto-profile");
         assert_eq!(counted.messages[0].input, 100);
         assert_eq!(counted.messages[0].output, 25);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_catdesk_usage_reaches_hermes_totals_and_model_report() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let streaming_cache = tempfile::TempDir::new().unwrap();
+        let catdesk_dir = source_home.path().join(".catdesk");
+        std::fs::create_dir_all(&catdesk_dir).unwrap();
+        std::fs::write(
+            catdesk_dir.join("usage.jsonl"),
+            concat!(
+                "{\"eventId\":\"evt-a\",\"timestampMs\":1788210000123,\"inputTokens\":12,\"outputTokens\":8,\"bucket\":\"through-gpt-5.6\"}\n",
+                "{\"eventId\":\"evt-b\",\"timestampMs\":1788210001123,\"inputTokens\":5,\"outputTokens\":7,\"bucket\":\"through-gpt-5.6\"}\n"
+            ),
+        )
+        .unwrap();
+
+        let home = source_home.path().to_str().unwrap().to_string();
+        let clients = vec!["hermes".to_string()];
+        let counted = parse_local_clients(LocalParseOptions {
+            home_dir: Some(home.clone()),
+            use_env_roots: false,
+            clients: Some(clients.clone()),
+            since: None,
+            until: None,
+            year: None,
+            scanner_settings: scanner::ScannerSettings::default(),
+            modified_after: None,
+        })
+        .unwrap();
+        assert_eq!(counted.counts.get(ClientId::Hermes), 2);
+        assert_eq!(counted.messages.len(), 2);
+        assert!(counted.messages.iter().all(|message| message.client == "hermes"));
+        assert!(
+            counted
+                .messages
+                .iter()
+                .all(|message| message.model_id == "catdesk-mcp")
+        );
+        assert_eq!(counted.messages.iter().map(|message| message.input).sum::<i64>(), 15);
+        assert_eq!(counted.messages.iter().map(|message| message.output).sum::<i64>(), 17);
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let report = with_isolated_tokscale_cache(streaming_cache.path(), || {
+            runtime
+                .block_on(get_model_report(ReportOptions {
+                    home_dir: Some(home),
+                    use_env_roots: false,
+                    clients: Some(clients),
+                    ..Default::default()
+                }))
+                .unwrap()
+        });
+        assert_eq!(report.total_input, 15);
+        assert_eq!(report.total_output, 17);
+        assert_eq!(report.total_messages, 2);
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].client, "hermes");
+        assert_eq!(report.entries[0].model, "catdesk-mcp");
+        assert_eq!(report.entries[0].provider, "catdesk");
+        assert_eq!(report.entries[0].input, 15);
+        assert_eq!(report.entries[0].output, 17);
+    }
+
+    #[test]
+    fn test_catdesk_pricing_identity_prices_reversed_mcp_tokens_without_relabeling_source() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let catdesk_dir = source_home.path().join(".catdesk");
+        std::fs::create_dir_all(&catdesk_dir).unwrap();
+        let ledger_path = catdesk_dir.join("usage.jsonl");
+        std::fs::write(
+            &ledger_path,
+            "{\"eventId\":\"evt-price\",\"timestampMs\":1788210000123,\"inputTokens\":12,\"outputTokens\":8,\"bucket\":\"through-gpt-5.6\",\"pricingModel\":\"gpt-5.6-sol\"}\n",
+        )
+        .unwrap();
+
+        let mut parsed = sessions::hermes::parse_catdesk_usage_jsonl_with_pricing_identity(&ledger_path);
+        assert_eq!(parsed.len(), 1);
+        let parsed = parsed.pop().unwrap();
+        assert_eq!(parsed.pricing_model, "gpt-5.6-sol");
+        assert_eq!(parsed.message.tokens.input, 8);
+        assert_eq!(parsed.message.tokens.output, 12);
+
+        let mut litellm = HashMap::new();
+        litellm.insert(
+            "gpt-5.6-sol".to_string(),
+            pricing::ModelPricing {
+                input_cost_per_token: Some(0.000004),
+                output_cost_per_token: Some(0.000020),
+                ..Default::default()
+            },
+        );
+        let pricing = pricing::PricingService::new(litellm, HashMap::new());
+        let mut message = parsed.message;
+        apply_pricing_identity_if_available(&mut message, Some(&pricing), &parsed.pricing_model);
+
+        assert_eq!(message.client, "hermes");
+        assert_eq!(message.model_id, "catdesk-mcp");
+        assert_eq!(message.provider_id, "catdesk");
+        let expected = 8.0 * 0.000004 + 12.0 * 0.000020;
+        assert!((message.cost - expected).abs() < 1e-12);
+        assert_eq!(message.cost_source, CostSource::Estimated);
     }
 
     #[test]

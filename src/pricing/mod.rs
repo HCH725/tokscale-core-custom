@@ -1,9 +1,11 @@
 pub mod aliases;
 pub mod cache;
+pub(crate) mod codex_chatgpt;
 pub mod custom;
 pub mod litellm;
 pub mod lookup;
 pub mod openrouter;
+pub(crate) mod opencode_go;
 
 use custom::CustomPricing;
 use lookup::{
