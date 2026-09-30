@@ -98,7 +98,9 @@ pub fn canonical_model_id(model_id: &str) -> String {
 /// The alias fold is **presentation only** and must never reach the
 /// submit/upload/export/persist path (those use [`canonical_model_id`]), pricing
 /// (which resolves the raw message `model_id`), or the message-cache key space.
-/// An empty/unset alias config makes this identical to [`canonical_model_id`].
+/// With no aliases installed this is [`canonical_model_id`] plus the one
+/// built-in rule in [`model_alias`] (Grok Build `grok-<version>-build` →
+/// `grok-<version>`).
 pub fn normalize_model_for_grouping(model_id: &str) -> String {
     model_alias::apply_global(normalize_syntactic(model_id))
 }
@@ -1753,8 +1755,16 @@ fn parse_all_messages_with_pricing_with_env_strategy(
             )
         })
         .collect();
+    // Cross-file dedup: a Pi fork copies its parent's records verbatim into a
+    // new session file (upstream #1323). First-wins in scan order.
+    let mut pi_seen: HashSet<String> = HashSet::new();
     for outcome in pi_outcomes {
-        all_messages.extend(outcome.messages);
+        all_messages.extend(
+            outcome
+                .messages
+                .into_iter()
+                .filter(|message| should_keep_deduped_message(&mut pi_seen, message)),
+        );
         if let Some(entry) = outcome.cache_entry {
             source_cache.insert(entry);
         }
@@ -4664,9 +4674,16 @@ where
             for parsed in sessions::hermes::parse_catdesk_usage_jsonl_with_pricing_identity(path) {
                 let mut m = parsed.message;
                 apply_pricing_identity_if_available(&mut m, pricing, &parsed.pricing_model);
-                if !passes_client(&m) { continue; }
-                let keep = m.dedup_key.as_ref().is_none_or(|k| k.is_empty() || dedup_gate_passes(k, &mut hermes_seen));
-                if keep && filter(&m) { sink(&m); }
+                if !passes_client(&m) {
+                    continue;
+                }
+                let keep = m
+                    .dedup_key
+                    .as_ref()
+                    .is_none_or(|k| k.is_empty() || dedup_gate_passes(k, &mut hermes_seen));
+                if keep && filter(&m) {
+                    sink(&m);
+                }
             }
         }
     }
@@ -5343,11 +5360,9 @@ fn apply_pricing_identity_if_available(
         return;
     };
     let pricing_provider = provider_identity::inferred_provider_from_model(pricing_model_id);
-    let Some(estimate) = pricing.estimate_cost_with_provider(
-        pricing_model_id,
-        pricing_provider,
-        &message.tokens,
-    ) else {
+    let Some(estimate) =
+        pricing.estimate_cost_with_provider(pricing_model_id, pricing_provider, &message.tokens)
+    else {
         return;
     };
     let calculated_cost = estimate.cost * pricing_multiplier(message);
@@ -6182,7 +6197,7 @@ fn parse_local_clients_inner(
                 .collect::<Vec<_>>()
         })
         .collect();
-    let droid_count = droid_msgs.len() as i32;
+    let droid_count = summed_parsed_message_count(&droid_msgs);
     counts.set(ClientId::Droid, droid_count);
     messages.extend(droid_msgs);
 
@@ -6200,15 +6215,16 @@ fn parse_local_clients_inner(
     counts.set(ClientId::OpenClaw, openclaw_count);
     messages.extend(openclaw_msgs);
 
-    let pi_msgs: Vec<ParsedMessage> = scan_result
+    let pi_msgs_raw: Vec<UnifiedMessage> = scan_result
         .get(ClientId::Pi)
         .par_iter()
-        .flat_map(|path| {
-            sessions::pi::parse_pi_file(path)
-                .into_iter()
-                .map(|msg| unified_to_parsed(&msg))
-                .collect::<Vec<_>>()
-        })
+        .flat_map(|path| sessions::pi::parse_pi_file(path))
+        .collect();
+    let mut pi_seen: HashSet<String> = HashSet::new();
+    let pi_msgs: Vec<ParsedMessage> = pi_msgs_raw
+        .into_iter()
+        .filter(|message| should_keep_deduped_message(&mut pi_seen, message))
+        .map(|message| unified_to_parsed(&message))
         .collect();
     let pi_count = pi_msgs.len() as i32;
     counts.set(ClientId::Pi, pi_count);
@@ -6720,8 +6736,8 @@ mod tests {
         agent_bucket_key, aggregate_model_usage_entries, apply_pricing_identity_if_available,
         apply_pricing_if_available, canonical_model_id, clear_model_aliases, coverage_for_messages,
         dedupe_latest_trae_messages, fold_messages_streaming, get_agents_report, get_hourly_report,
-        get_model_report, get_model_report_with_source_context, get_monthly_report, get_window_usage,
-        latest_source_mtime_ms, load_pricing_for_local_parse_with_context,
+        get_model_report, get_model_report_with_source_context, get_monthly_report,
+        get_window_usage, latest_source_mtime_ms, load_pricing_for_local_parse_with_context,
         local_source_change_token, local_source_change_token_with_source_context, message_cache,
         model_alias_generation, normalize_model_for_grouping, normalize_syntactic,
         opencode_authoritative_sources, opencode_identity_group,
@@ -7471,10 +7487,7 @@ mod tests {
             .await
             .expect("window scan must succeed");
         assert_eq!(usage.messages.len(), 1);
-        assert_eq!(
-            usage.messages[0].model_id,
-            canonical_model_id(raw_model_id)
-        );
+        assert_eq!(usage.messages[0].model_id, canonical_model_id(raw_model_id));
         assert_ne!(
             usage.messages[0].model_id, raw_model_id,
             "the fixture's raw id must actually change under canonicalization, or this test proves nothing"
@@ -10914,6 +10927,69 @@ mod tests {
         }
     }
 
+    /// Syrtis #118: with no aliases installed, Grok Build's `grok-4.6-build`
+    /// usage key and the bare `grok-4.6` merge into one model-report row whose
+    /// tokens, messages and cost are the exact sums; the raw identity path and
+    /// an unrelated model are untouched.
+    #[test]
+    fn grok_build_rows_group_under_the_bare_version_without_aliases() {
+        let _guard = crate::model_alias::lock_global_alias_tests();
+        clear_model_aliases();
+
+        let message = |model: &str, input: i64, output: i64, cost: f64| {
+            let mut m = UnifiedMessage::new(
+                "grok",
+                model,
+                "xai",
+                "s1",
+                1_733_011_200_000,
+                TokenBreakdown {
+                    input,
+                    output,
+                    cache_read: 7,
+                    cache_write: 0,
+                    reasoning: 3,
+                    cache_write_1h: 0,
+                },
+                cost,
+            );
+            m.mark_estimated_cost();
+            m
+        };
+        let entries = aggregate_model_usage_entries(
+            vec![
+                message("grok-4.6-build", 100, 20, 0.25),
+                message("grok-4.6", 50, 10, 0.5),
+                message("grok-code-fast-1", 9, 1, 0.125),
+            ],
+            &GroupBy::Model,
+        );
+
+        let mut rows: Vec<_> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e.model.as_str(),
+                    e.input,
+                    e.output,
+                    e.cache_read,
+                    e.reasoning,
+                    e.message_count,
+                    e.cost,
+                )
+            })
+            .collect();
+        rows.sort_by(|a, b| a.0.cmp(b.0));
+        assert_eq!(
+            rows,
+            vec![
+                ("grok-4.6", 150, 30, 14, 6, 2, 0.75),
+                ("grok-code-fast-1", 9, 1, 7, 3, 1, 0.125),
+            ]
+        );
+        assert_eq!(canonical_model_id("grok-4.6-build"), "grok-4.6-build");
+    }
+
     #[test]
     fn model_aliases_fold_grouping_only_not_canonical_or_pricing() {
         let _guard = crate::model_alias::lock_global_alias_tests();
@@ -11737,7 +11813,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_cursor_parse_path_reprices_zero_cost_composer_1_5_rows() {
+    fn test_cursor_parse_path_reprices_missing_cost_composer_1_5_rows() {
         let cache_home = tempfile::TempDir::new().unwrap();
         let _env = EnvGuard::set(&[
             ("HOME", cache_home.path().as_os_str()),
@@ -11748,7 +11824,7 @@ mod tests {
         std::fs::create_dir_all(&cursor_cache_dir).unwrap();
 
         let csv = r#"Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost
-"2026-03-04T12:00:00.000Z","Included","Composer 1.5","No","1200","1000","5000","2000","8000","0""#;
+"2026-03-04T12:00:00.000Z","Included","Composer 1.5","No","1200","1000","5000","2000","8000","Included""#;
         std::fs::write(cursor_cache_dir.join("usage.csv"), csv).unwrap();
 
         let pricing = pricing::PricingService::new(HashMap::new(), HashMap::new());
@@ -11762,6 +11838,7 @@ mod tests {
         assert_eq!(messages[0].client, "cursor");
         assert_eq!(messages[0].model_id, "Composer 1.5");
         assert!(messages[0].cost > 0.0);
+        assert!(!messages[0].has_authoritative_cost());
     }
 
     fn write_kimi_repeated_status_fixture_at(session_dir: &Path) {
@@ -12012,6 +12089,82 @@ mod tests {
             assert_eq!(messages.iter().map(|m| m.tokens.input).sum::<i64>(), 40);
             assert_eq!(messages.iter().map(|m| m.tokens.output).sum::<i64>(), 5);
         }
+    }
+
+    // Ported from upstream #1323: two Pi session files carrying the same
+    // `responseId` with conflicting usage keep the first copy in scan-path
+    // order, on the count lane; the materialized and streaming lanes must
+    // agree with it.
+    #[test]
+    #[serial_test::serial]
+    fn test_pi_fork_copies_dedup_first_wins_on_every_lane() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let sessions_dir = source_home.path().join(".pi/agent/sessions/--fixture--");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let record = |session: &str, input: i64, output: i64| {
+            let total = input + output;
+            format!(
+                r#"{{"type":"session","id":"{session}","timestamp":"2026-09-06T12:00:00.000Z","cwd":"/tmp/demo"}}"#,
+            ) + "\n"
+                + &format!(
+                    r#"{{"type":"message","id":"entry-fork-copy","parentId":"{session}","timestamp":"2026-09-06T12:00:00.000Z","message":{{"role":"assistant","provider":"openai-codex","model":"gpt-6-astra","responseId":"resp-demo-fork","usage":{{"input":{input},"output":{output},"cacheRead":0,"cacheWrite":0,"totalTokens":{total}}}}}}}"#
+                )
+                + "\n"
+        };
+        std::fs::write(
+            sessions_dir.join("session-a.jsonl"),
+            record("session-a", 100, 20),
+        )
+        .unwrap();
+        std::fs::write(
+            sessions_dir.join("session-b.jsonl"),
+            record("session-b", 999, 999),
+        )
+        .unwrap();
+
+        for _ in 0..25 {
+            let parsed = parse_local_clients(LocalParseOptions {
+                home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(vec!["pi".to_string()]),
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(parsed.counts.get(ClientId::Pi), 1);
+            assert_eq!(parsed.messages.len(), 1);
+            assert_eq!(parsed.messages[0].input, 100);
+            assert_eq!(parsed.messages[0].output, 20);
+        }
+
+        let materialized = parse_all_messages_with_pricing_with_env_strategy(
+            source_home.path().to_str().unwrap(),
+            &["pi".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            None,
+        );
+        assert_eq!(materialized.len(), 1);
+        assert_eq!(materialized[0].tokens.input, 100);
+
+        let mut streamed = Vec::new();
+        scan_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &["pi".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_m: &UnifiedMessage| true,
+            &mut |m: &UnifiedMessage| streamed.push(m.clone()),
+        );
+        assert_eq!(streamed.len(), 1);
+        assert_eq!(streamed[0].tokens.input, 100);
     }
 
     #[test]
@@ -15404,7 +15557,7 @@ mod tests {
             std::fs::create_dir_all(&cursor_cache_dir).unwrap();
 
             let csv = r#"Date,Kind,Model,Max Mode,Input (w/ Cache Write),Input (w/o Cache Write),Cache Read,Output Tokens,Total Tokens,Cost
-"2026-03-04T12:00:00.000Z","Included","Composer 1.5","No","1200","1000","5000","2000","8000","0""#;
+"2026-03-04T12:00:00.000Z","Included","Composer 1.5","No","1200","1000","5000","2000","8000","Included""#;
             std::fs::write(cursor_cache_dir.join("usage.csv"), csv).unwrap();
 
             let mut litellm = HashMap::new();
@@ -16672,6 +16825,67 @@ mod tests {
         assert_eq!(parsed.messages[0].provider_id, "fireworks_ai");
     }
 
+    /// The Droid count lane reports the replies the fragments stand for, not
+    /// the number of fragments. A session whose replies run past the turn cap
+    /// (`sessions::droid`'s `MAX_TURNS_PER_SESSION`, 1024) is coalesced into
+    /// runs, so a fragment count would report 550 calls for the 1100 this
+    /// session made, while the summed per-fragment counts keep the total
+    /// Droid recorded — the helper every other client's count lane uses.
+    #[test]
+    #[serial_test::serial]
+    fn test_parse_local_clients_droid_count_sums_coalesced_reply_counts() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let droid_dir = source_home.path().join(".factory/sessions");
+        std::fs::create_dir_all(&droid_dir).unwrap();
+        std::fs::write(
+            droid_dir.join("droid-session.settings.json"),
+            r#"{"providerLock":"anthropic","providerLockTimestamp":"2026-01-01T00:00:00Z","tokenUsage":{"inputTokens":1000,"outputTokens":20}}"#,
+        )
+        .unwrap();
+        let replies = 1_100usize;
+        let transcript = (0..replies)
+            .map(|i| {
+                format!(
+                    r#"{{"type":"message","timestamp":"2026-08-07T{:02}:{:02}:00Z","message":{{"role":"assistant","content":"x"}}}}"#,
+                    i / 60,
+                    i % 60
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(droid_dir.join("droid-session.jsonl"), transcript).unwrap();
+
+        let parsed = with_isolated_tokscale_cache(cache_home.path(), || {
+            parse_local_clients(LocalParseOptions {
+                home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(vec!["droid".to_string()]),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings: scanner::ScannerSettings::default(),
+                modified_after: None,
+            })
+            .unwrap()
+        });
+
+        let fragments = parsed
+            .messages
+            .iter()
+            .filter(|message| message.client == "droid")
+            .count();
+        assert!(
+            fragments < replies && fragments <= 1024,
+            "replies must coalesce into runs for the two lanes to differ: {fragments}"
+        );
+        assert_eq!(
+            parsed.counts.get(ClientId::Droid),
+            replies as i32,
+            "the Droid count lane is the session's replies, not its fragments"
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn test_parse_all_messages_fireworks_provider_kept_under_synthetic_only_filter() {
@@ -17005,15 +17219,30 @@ mod tests {
         .unwrap();
         assert_eq!(counted.counts.get(ClientId::Hermes), 2);
         assert_eq!(counted.messages.len(), 2);
-        assert!(counted.messages.iter().all(|message| message.client == "hermes"));
-        assert!(
+        assert!(counted
+            .messages
+            .iter()
+            .all(|message| message.client == "hermes"));
+        assert!(counted
+            .messages
+            .iter()
+            .all(|message| message.model_id == "catdesk-mcp"));
+        assert_eq!(
             counted
                 .messages
                 .iter()
-                .all(|message| message.model_id == "catdesk-mcp")
+                .map(|message| message.input)
+                .sum::<i64>(),
+            15
         );
-        assert_eq!(counted.messages.iter().map(|message| message.input).sum::<i64>(), 15);
-        assert_eq!(counted.messages.iter().map(|message| message.output).sum::<i64>(), 17);
+        assert_eq!(
+            counted
+                .messages
+                .iter()
+                .map(|message| message.output)
+                .sum::<i64>(),
+            17
+        );
 
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -17052,7 +17281,8 @@ mod tests {
         )
         .unwrap();
 
-        let mut parsed = sessions::hermes::parse_catdesk_usage_jsonl_with_pricing_identity(&ledger_path);
+        let mut parsed =
+            sessions::hermes::parse_catdesk_usage_jsonl_with_pricing_identity(&ledger_path);
         assert_eq!(parsed.len(), 1);
         let parsed = parsed.pop().unwrap();
         assert_eq!(parsed.pricing_model, "gpt-5.6-sol");
@@ -17266,6 +17496,88 @@ mod tests {
                 "both conversations reusing responseId \"SHARED\" must survive"
             );
         }
+    }
+
+    // The `steps` turn time must date the row identically on the materialized,
+    // streaming and count lanes; each lane calls the parser on its own.
+    #[test]
+    #[serial_test::serial]
+    fn test_antigravity_cli_three_lanes_parity_with_step_timestamp() {
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let source_home = tempfile::TempDir::new().unwrap();
+        let _env = EnvGuard::set(&[
+            ("HOME", cache_home.path().as_os_str()),
+            ("TOKSCALE_CONFIG_DIR", cache_home.path().as_os_str()),
+        ]);
+
+        let conv_dir = source_home
+            .path()
+            .join(".gemini/antigravity-cli/conversations");
+        write_antigravity_cli_db(&conv_dir, "conv-parity", "resp-parity-1");
+
+        // steps.metadata = {#1: {#1: seconds}, #9: {#11: responseId}}
+        let step_seconds: u64 = 1_789_200_000;
+        let mut ts = vec![0x08];
+        let mut v = step_seconds;
+        loop {
+            let byte = (v & 0x7f) as u8;
+            v >>= 7;
+            ts.push(if v == 0 { byte } else { byte | 0x80 });
+            if v == 0 {
+                break;
+            }
+        }
+        let resp = b"resp-parity-1";
+        let mut m9 = vec![(11 << 3) | 2, resp.len() as u8];
+        m9.extend_from_slice(resp);
+        let mut metadata = vec![(1 << 3) | 2, ts.len() as u8];
+        metadata.extend(ts);
+        metadata.extend([(9 << 3) | 2, m9.len() as u8]);
+        metadata.extend(m9);
+        let conn = rusqlite::Connection::open(conv_dir.join("conv-parity.db")).unwrap();
+        conn.execute_batch("CREATE TABLE steps (idx integer, step_type integer, metadata blob);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO steps (idx, step_type, metadata) VALUES (0, 15, ?1)",
+            rusqlite::params![metadata],
+        )
+        .unwrap();
+        drop(conn);
+        let expected_ts = step_seconds as i64 * 1000;
+
+        let mat_messages = parse_all_messages_with_pricing_with_env_strategy(
+            source_home.path().to_str().unwrap(),
+            &["antigravity-cli".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            None,
+        );
+        assert_eq!(mat_messages.len(), 1);
+        assert_eq!(mat_messages[0].timestamp, expected_ts);
+
+        let mut stream_messages = Vec::new();
+        scan_messages_streaming(
+            source_home.path().to_str().unwrap(),
+            &["antigravity-cli".to_string()],
+            None,
+            false,
+            &scanner::ScannerSettings::default(),
+            &|_m: &UnifiedMessage| true,
+            &mut |m: &UnifiedMessage| stream_messages.push(m.clone()),
+        );
+        assert_eq!(stream_messages.len(), 1);
+        assert_eq!(stream_messages[0].timestamp, expected_ts);
+
+        let count_result = parse_local_clients(LocalParseOptions {
+            home_dir: Some(source_home.path().to_string_lossy().to_string()),
+            clients: Some(vec!["antigravity-cli".to_string()]),
+            use_env_roots: false,
+            ..Default::default()
+        })
+        .unwrap();
+        assert_eq!(count_result.messages.len(), 1);
+        assert_eq!(count_result.messages[0].timestamp, expected_ts);
     }
 
     // jcode (`~/.jcode/sessions/session_*.json`) must be discovered by the
