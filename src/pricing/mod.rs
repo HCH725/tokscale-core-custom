@@ -4,8 +4,8 @@ pub(crate) mod codex_chatgpt;
 pub mod custom;
 pub mod litellm;
 pub mod lookup;
-pub mod openrouter;
 pub(crate) mod opencode_go;
+pub mod openrouter;
 
 use custom::CustomPricing;
 use lookup::{

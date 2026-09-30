@@ -625,7 +625,6 @@ mod tests {
         }
     }
 
-
     #[test]
     fn test_openai_codex_included_with_invalid_actual_cost_is_not_subscription() {
         let (_dir, db_path) = create_test_db();

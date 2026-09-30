@@ -1,12 +1,12 @@
 # tokscale-core Custom
 
-This private repository is the canonical tokscale-core dependency for `HCH725/TokenBar-custom`.
+This private repository is the canonical tokscale-core dependency for the private Syrtis consumer in `HCH725/TokenBar-custom`.
 
 ## Repository relationship
 
 - `origin`: `HCH725/tokscale-core-custom` — private canonical downstream.
-- `upstream`: `Nanako0129/tokscale-core` — official source.
-- TokenBar pins an exact commit from this repository as its `vendor/tokscale-core` submodule.
+- `upstream`: `Nanako0129/tokscale-core` — official source; the current Syrtis v2.2 rebase baseline is `319ffa8ca75f6cd2bfaf96ae0d295a8fa618ec2c`.
+- The private Syrtis consumer pins an exact reviewed commit from this repository as its `vendor/tokscale-core` submodule.
 
 ## Current downstream contract
 
@@ -38,6 +38,10 @@ Hermes usage attributed to `provider=opencode-go` (or normalized `opencode_go`) 
 
 Current covered Go models are `mimo-v2.5`, `mimo-v2.5-pro`, `muse-spark-1.2-contributor`, `deepseek-v4-pro`, `deepseek-v4-flash`, and `deepseek-v4-flash-vision-exp`. DeepSeek V4 applies the official weekday UTC peak windows `[01:00,04:00)` and `[06:00,10:00)`; weekends and all other times are off-peak. Hermes `output_tokens` already represents billable completion output, so the separate `reasoning_tokens` field must not be charged again on this path. Pricing source: `https://opencode.ai/docs/go/`.
 
+### Codex subscription equivalents
+
+Hermes `openai-codex` rows explicitly marked `cost_status=included` with `billing_mode=subscription_included` or `codex_responses` keep authoritative raw incremental cost `$0`. A separate recorded-model ChatGPT Work/Codex rate-card equivalent is exposed for attribution/reporting only; it must never overwrite provider-reported cost or be interpreted as 5-hour/weekly quota depletion.
+
 ## Update workflow
 
-When the upstream core revision used by TokenBar changes, start from that new upstream revision, re-evaluate whether this custom parser is still needed, port only the minimum surviving delta, run `git diff --check` and the complete `cargo test` suite, then update TokenBar's submodule pointer only after review/audit.
+When the public core revision used by Syrtis changes, start from that new upstream revision, re-evaluate every private delta, port only the minimum surviving CatDesk/OpenCode Go/Codex contract, run `git diff --check`, targeted rustfmt on touched Rust files, the complete `cargo test` suite, and clippy, then update Syrtis's submodule pointer only after independent review/audit.
