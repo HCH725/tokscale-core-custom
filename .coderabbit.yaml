@@ -35,8 +35,8 @@ reviews:
     #
     # THOSE MEASUREMENTS CANNOT SETTLE THE STAR-COUNT QUESTION, and an earlier
     # version of this comment claimed they did. Every one of them was taken
-    # while this account was inside a paid Advanced trial that does not expire
-    # until 2026-10-02 (see the plan block below). A paid plan reviews
+    # while this account was inside a paid plan trial that has not yet expired
+    # (see the account-level note below). A paid plan reviews
     # automatically regardless of star count, so it explains the observations
     # completely. Nothing above distinguishes "the OSS tier is automatic
     # anyway" from "the paid trial is what made it automatic".
@@ -49,10 +49,10 @@ reviews:
     # -- but a vendor marketing page is weaker evidence than a measurement, and
     # the measurement is confounded.
     #
-    # SO THERE IS A TEST TO RUN, and it has a date. On the first pull request
-    # after 2026-10-02, check whether CodeRabbit reviews it WITHOUT a manual
-    # trigger. That is the observation this file still needs. Checking the
-    # billing page is a separate errand and does not answer it.
+    # SO THERE IS A TEST TO RUN. On the first pull request after the account's
+    # paid trial ends, check whether CodeRabbit reviews it WITHOUT a manual
+    # trigger. That is the observation this file still needs. The billing page
+    # is a separate errand and does not answer it.
     #
     # If it turns out automatic review does stop, the failure is quiet rather
     # than loud, which is why this is written down: 'enabled: true' and this
