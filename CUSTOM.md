@@ -42,6 +42,12 @@ Current covered Go models are `mimo-v2.5`, `mimo-v2.5-pro`, `muse-spark-1.2-cont
 
 Hermes `openai-codex` rows explicitly marked `cost_status=included` with `billing_mode=subscription_included` or `codex_responses` keep authoritative raw incremental cost `$0`. A separate recorded-model ChatGPT Work/Codex rate-card equivalent is exposed for attribution/reporting only; it must never overwrite provider-reported cost or be interpreted as 5-hour/weekly quota depletion.
 
+### Temporary Syrtis v2.2 baseline remediations
+
+Public baseline `319ffa8` carries two Droid reply-count defects found while reviewing the private rebase: multi-day reply counts ride on the first fragment, and local client counts use fragment count instead of the fragments' coalesced reply totals. This fork keeps each fragment's own `message_count`, sums those counts for the Droid local-client total, and bumps only Droid `parser_version` from 2 to 3 so unchanged cached parser output is rebuilt; `CACHE_FORMAT_VERSION` is unchanged. Drop these hunks when upstream incorporates an equivalent fix.
+
+The same review found account-only CodeRabbit billing/trial details embedded in configuration comments. Those details are intentionally generalized here without changing CodeRabbit behavior; repository configuration must not carry account billing metadata.
+
 ## Update workflow
 
 When the public core revision used by Syrtis changes, start from that new upstream revision, re-evaluate every private delta, port only the minimum surviving CatDesk/OpenCode Go/Codex contract, run `git diff --check`, targeted rustfmt on touched Rust files, the complete `cargo test` suite, and clippy, then update Syrtis's submodule pointer only after independent review/audit.

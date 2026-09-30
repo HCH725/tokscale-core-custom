@@ -501,12 +501,6 @@ pub fn parse_droid_file(path: &Path) -> Vec<UnifiedMessage> {
         let output = apportion(totals.output, &output_weights, total_output);
         let reasoning = apportion(totals.reasoning, &output_weights, total_output);
 
-        // One Droid session made this many API calls, however many records its
-        // spend is spread over.
-        let session_replies = turns
-            .iter()
-            .fold(0i32, |sum, turn| sum.saturating_add(turn.replies.max(1)));
-
         return turns
             .iter()
             .enumerate()
@@ -527,17 +521,12 @@ pub fn parse_droid_file(path: &Path) -> Vec<UnifiedMessage> {
                     },
                     0.0,
                 );
-                // These records are attribution fragments of one session, not
-                // separate sessions. Upstream carries the session's reply total
-                // on exactly one record (the rest count 0) because its
-                // `sessionize` opens a new interval whenever two records sit
-                // more than the idle gap apart. This fork's `sessionize` groups
-                // by `(client, session_id)` instead, so here the rule is kept
-                // for fidelity, not for the session count; its visible effect
-                // is that a multi-day session's reply count lands on the day
-                // of its first reply. The guard for the rule is
-                // `test_reply_count_rides_on_exactly_one_record`.
-                message.message_count = if index == 0 { session_replies } else { 0 };
+                // Each attribution fragment owns the replies represented by
+                // that fragment. `sessionize` still groups all fragments by
+                // `(client, session_id)`, so distributing message_count this
+                // way fixes per-day reply attribution without changing the
+                // session count. Coalesced runs may represent multiple replies.
+                message.message_count = turn.replies.max(1);
                 message
             })
             .collect();
@@ -984,7 +973,7 @@ mod tests {
     }
 
     #[test]
-    fn test_reply_count_rides_on_exactly_one_record() {
+    fn test_reply_count_follows_each_fragment() {
         let temp_dir = tempfile::TempDir::new().unwrap();
         let settings = write_session(
             temp_dir.path(),
@@ -999,10 +988,11 @@ mod tests {
         let messages = parse_droid_file(&settings);
 
         assert_eq!(messages.len(), 2);
-        // Both calls are counted, but only one record is countable: the second
-        // is an attribution fragment of the same session, not a new session.
+        // Each dated fragment owns its own call so daily aggregation cannot
+        // move the second day's reply onto the first day.
         assert_eq!(messages.iter().map(|m| m.message_count).sum::<i32>(), 2);
-        assert_eq!(messages.iter().filter(|m| m.message_count > 0).count(), 1);
+        assert_eq!(messages.iter().filter(|m| m.message_count > 0).count(), 2);
+        assert!(messages.iter().all(|m| m.message_count == 1));
     }
 
     #[test]
@@ -1011,8 +1001,9 @@ mod tests {
         // 40 replies ten minutes apart. Ported from upstream, where every gap
         // would open its own session interval. This fork's `sessionize` groups
         // by session_id, so the session count is 1 here regardless of how
-        // message_count is split: on the fork this test cannot fail on its
-        // own; `test_reply_count_rides_on_exactly_one_record` is the guard.
+        // message_count is split across the fragments: on the fork this test
+        // cannot fail on its own; `test_reply_count_follows_each_fragment` is
+        // the per-fragment guard.
         let replies = 40;
         let transcript: Vec<String> = (0..replies)
             .map(|i| {

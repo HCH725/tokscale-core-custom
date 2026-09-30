@@ -6197,7 +6197,7 @@ fn parse_local_clients_inner(
                 .collect::<Vec<_>>()
         })
         .collect();
-    let droid_count = droid_msgs.len() as i32;
+    let droid_count = summed_parsed_message_count(&droid_msgs);
     counts.set(ClientId::Droid, droid_count);
     messages.extend(droid_msgs);
 

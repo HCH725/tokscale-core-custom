@@ -922,7 +922,13 @@ fn parser_version(client: ClientId) -> u32 {
         // fingerprint stays valid forever and only this bump discards a v1
         // entry's single lock-anchored record. Vendor-local numbering: never
         // copy upstream's parser_version 7 (see UPSTREAM.md).
-        ClientId::Droid => 2,
+        //
+        // 3: apportioned Droid fragments now carry their own coalesced reply
+        // count instead of placing the whole session reply total on the first
+        // fragment. `message_count` is serialized in cached parser output, so
+        // unchanged settings/transcript fingerprints need this bump to rebuild
+        // the corrected per-day attribution.
+        ClientId::Droid => 3,
         // 2: OpenCode 2.x renamed the session metadata table `session` ->
         // `session_v2`, so the v2 `session_message` parse now falls back to
         // the renamed join table. An unchanged database fingerprint whose
@@ -5801,9 +5807,11 @@ mod tests {
         // this number exists -- without the bump `get` treats a stale entry
         // as a hit and the new parse never runs.
         assert_eq!(parser_version(ClientId::Claude), 4);
-        // 2 is the transcript-weighted per-reply attribution split (vendor-local
-        // numbering; never upstream's 7 — see UPSTREAM.md).
-        assert_eq!(parser_version(ClientId::Droid), 2);
+        // 2 is the transcript-weighted per-reply attribution split; 3 moves
+        // each fragment's coalesced reply count onto that fragment so cached
+        // per-day message attribution is rebuilt (vendor-local numbering;
+        // never upstream's 7 — see UPSTREAM.md).
+        assert_eq!(parser_version(ClientId::Droid), 3);
         assert_eq!(CacheIdentity::synthetic().parser_version, 1);
         for client in ClientId::iter() {
             if !matches!(
