@@ -16825,6 +16825,67 @@ mod tests {
         assert_eq!(parsed.messages[0].provider_id, "fireworks_ai");
     }
 
+    /// The Droid count lane reports the replies the fragments stand for, not
+    /// the number of fragments. A session whose replies run past the turn cap
+    /// (`sessions::droid`'s `MAX_TURNS_PER_SESSION`, 1024) is coalesced into
+    /// runs, so a fragment count would report 550 calls for the 1100 this
+    /// session made, while the summed per-fragment counts keep the total
+    /// Droid recorded — the helper every other client's count lane uses.
+    #[test]
+    #[serial_test::serial]
+    fn test_parse_local_clients_droid_count_sums_coalesced_reply_counts() {
+        let source_home = tempfile::TempDir::new().unwrap();
+        let cache_home = tempfile::TempDir::new().unwrap();
+        let droid_dir = source_home.path().join(".factory/sessions");
+        std::fs::create_dir_all(&droid_dir).unwrap();
+        std::fs::write(
+            droid_dir.join("droid-session.settings.json"),
+            r#"{"providerLock":"anthropic","providerLockTimestamp":"2026-01-01T00:00:00Z","tokenUsage":{"inputTokens":1000,"outputTokens":20}}"#,
+        )
+        .unwrap();
+        let replies = 1_100usize;
+        let transcript = (0..replies)
+            .map(|i| {
+                format!(
+                    r#"{{"type":"message","timestamp":"2026-08-07T{:02}:{:02}:00Z","message":{{"role":"assistant","content":"x"}}}}"#,
+                    i / 60,
+                    i % 60
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(droid_dir.join("droid-session.jsonl"), transcript).unwrap();
+
+        let parsed = with_isolated_tokscale_cache(cache_home.path(), || {
+            parse_local_clients(LocalParseOptions {
+                home_dir: Some(source_home.path().to_str().unwrap().to_string()),
+                use_env_roots: false,
+                clients: Some(vec!["droid".to_string()]),
+                since: None,
+                until: None,
+                year: None,
+                scanner_settings: scanner::ScannerSettings::default(),
+                modified_after: None,
+            })
+            .unwrap()
+        });
+
+        let fragments = parsed
+            .messages
+            .iter()
+            .filter(|message| message.client == "droid")
+            .count();
+        assert!(
+            fragments < replies && fragments <= 1024,
+            "replies must coalesce into runs for the two lanes to differ: {fragments}"
+        );
+        assert_eq!(
+            parsed.counts.get(ClientId::Droid),
+            replies as i32,
+            "the Droid count lane is the session's replies, not its fragments"
+        );
+    }
+
     #[test]
     #[serial_test::serial]
     fn test_parse_all_messages_fireworks_provider_kept_under_synthetic_only_filter() {
